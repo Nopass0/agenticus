@@ -90,8 +90,8 @@ impl Tool for ProcessListTool {
 
         for (pid, name, cpu, mem) in &processes {
             let mem_mb = *mem as f64 / 1_048_576.0;
-            let display_name = if name.len() > 20 {
-                format!("{}...", &name[..17])
+            let display_name = if name.chars().count() > 20 {
+                format!("{}...", name.chars().take(17).collect::<String>())
             } else {
                 format!("{:20}", name)
             };

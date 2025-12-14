@@ -10,6 +10,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Safely truncate a UTF-8 string to a maximum number of characters
+/// (not bytes) to avoid panics with multi-byte characters like Cyrillic
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
+}
+
 /// Status of a task in the plan
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -140,8 +151,7 @@ impl ExecutionPlan {
                 TaskStatus::Pending => "⏳",
             };
             let result_preview = t.result.as_ref().map(|r| {
-                let preview = if r.len() > 50 { &r[..50] } else { r };
-                format!(" → {}", preview)
+                format!(" → {}", truncate_str(r, 50))
             }).unwrap_or_default();
             s.push_str(&format!("{} [{}] {}{}\n", icon, t.id, t.description, result_preview));
         }
@@ -157,8 +167,7 @@ impl ExecutionPlan {
                 self.collected_data.iter()
                     .enumerate()
                     .map(|(i, d)| {
-                        let preview = if d.len() > 500 { &d[..500] } else { d };
-                        format!("{}. {}", i + 1, preview)
+                        format!("{}. {}", i + 1, truncate_str(d, 500))
                     })
                     .collect::<Vec<_>>()
                     .join("\n")

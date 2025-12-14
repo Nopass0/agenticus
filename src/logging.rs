@@ -166,8 +166,8 @@ pub fn format_log_entry(log: &InteractionLog) -> String {
     output.push_str(&format!("Success: {}\n", log.success));
 
     if let Some(response) = &log.final_response {
-        let preview = if response.len() > 200 {
-            format!("{}...", &response[..200])
+        let preview = if response.chars().count() > 200 {
+            format!("{}...", response.chars().take(200).collect::<String>())
         } else {
             response.clone()
         };

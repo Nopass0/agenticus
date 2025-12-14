@@ -112,8 +112,8 @@ impl Tool for HttpRequestTool {
         });
 
         let output = if status.is_success() {
-            let body_preview = if body.len() > 1000 {
-                format!("{}... [truncated]", &body[..1000])
+            let body_preview = if body.chars().count() > 1000 {
+                format!("{}... [truncated]", body.chars().take(1000).collect::<String>())
             } else {
                 body
             };

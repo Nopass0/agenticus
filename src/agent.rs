@@ -41,6 +41,8 @@ pub struct ExecutionPlan {
     pub goal: String,
     pub tasks: Vec<PlanTask>,
     pub current_task_id: Option<usize>,
+    #[serde(default)]
+    pub collected_data: Vec<String>,
 }
 
 impl ExecutionPlan {
@@ -49,6 +51,7 @@ impl ExecutionPlan {
             goal: goal.to_string(),
             tasks: Vec::new(),
             current_task_id: None,
+            collected_data: Vec::new(),
         }
     }
 
@@ -93,8 +96,13 @@ impl ExecutionPlan {
 
     pub fn set_task_result(&mut self, id: usize, result: String) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
-            task.result = Some(result);
-            task.status = TaskStatus::Completed;
+            // Don't accept fake results
+            if !result.is_empty() && result != "Выполнено" && result != "Done" && result.len() > 10 {
+                task.result = Some(result.clone());
+                task.status = TaskStatus::Completed;
+                // Store as collected data for context
+                self.collected_data.push(result);
+            }
         }
     }
 
@@ -131,9 +139,31 @@ impl ExecutionPlan {
                 TaskStatus::Parallel => "⚡",
                 TaskStatus::Pending => "⏳",
             };
-            s.push_str(&format!("{} [{}] {}\n", icon, t.id, t.description));
+            let result_preview = t.result.as_ref().map(|r| {
+                let preview = if r.len() > 50 { &r[..50] } else { r };
+                format!(" → {}", preview)
+            }).unwrap_or_default();
+            s.push_str(&format!("{} [{}] {}{}\n", icon, t.id, t.description, result_preview));
         }
         s
+    }
+
+    pub fn get_collected_context(&self) -> String {
+        if self.collected_data.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n## COLLECTED DATA FROM PREVIOUS STEPS (USE THIS!):\n{}\n",
+                self.collected_data.iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let preview = if d.len() > 500 { &d[..500] } else { d };
+                        format!("{}. {}", i + 1, preview)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
     }
 }
 
@@ -195,9 +225,15 @@ struct ModelResponse {
     current_task: Option<usize>,
     // Plan modification fields
     add_tasks: Option<Vec<TaskResponse>>,
-    complete_task: Option<usize>,
+    complete_task: Option<CompleteTaskRequest>,
     fail_task: Option<FailTaskRequest>,
     update_task: Option<UpdateTaskRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompleteTaskRequest {
+    task_id: usize,
+    result: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,7 +352,7 @@ impl Agent {
         }
     }
 
-    fn system_prompt(&self, context: &str) -> String {
+    fn system_prompt(&self, context: &str, collected_data: &str) -> String {
         let tools_desc = self.registry.format_for_prompt();
         let language = &self.config.general.language;
 
@@ -324,6 +360,9 @@ impl Agent {
 
         // Add context if present
         prompt.push_str(context);
+
+        // Add collected data from previous steps
+        prompt.push_str(collected_data);
 
         // Main instructions
         prompt.push_str(&format!(
@@ -385,10 +424,12 @@ impl Agent {
 }
 ```
 
-### 5. Mark task as complete/failed:
+### 5. Mark task as complete (ONLY with real result):
 ```json
-{"thought": "Task done", "action": "complete_task", "complete_task": 1}
+{"thought": "Task done with real data", "action": "complete_task", "complete_task": {"task_id": 1, "result": "Actual result data - NOT just 'Выполнено'!"}}
 ```
+
+### 5b. Mark task as failed:
 ```json
 {"thought": "Task failed", "action": "fail_task", "fail_task": {"task_id": 1, "reason": "Error reason"}}
 ```
@@ -404,34 +445,45 @@ impl Agent {
 
 2. **SPECIFY current_task**: When using use_tool, ALWAYS specify task number
 
-3. **NO final_answer UNTIL ALL TASKS ARE DONE!**
+3. **USE PREVIOUS RESULTS!**
+   - Data from previous steps is shown in COLLECTED DATA section above
+   - USE this data! Don't search for the same info again!
+   - If you found games/items in step 1, use that list in step 2!
+   - READ the collected data before making new requests!
+
+4. **NO final_answer UNTIL ALL TASKS ARE DONE!**
    - Check status: pending, in_progress, completed, failed
    - final_answer ONLY when ALL tasks = completed
 
-4. **MODIFY PLAN**: If needed - add new tasks via modify_plan
+5. **MODIFY PLAN**: If needed - add new tasks via modify_plan
 
-5. **WEB SEQUENCE** (ОБЯЗАТЕЛЬНО!):
+6. **WEB SEQUENCE** (ОБЯЗАТЕЛЬНО!):
    - web_search -> найти URL
    - web_fetch -> загрузить контент с КОНКРЕТНОГО URL из результатов поиска
    - ПРОВЕРЬ что контент НЕ пустой!
    - write_file -> сохранить РЕАЛЬНЫЕ данные (НЕ placeholder!)
    - open_with_default -> открыть
 
-6. **PARALLELISM**: Use parallel_execute for multiple web_fetch
+7. **PARALLELISM**: Use parallel_execute for multiple web_fetch
 
-7. **НИКОГДА НЕ ПИШИ PLACEHOLDER!**
+8. **НИКОГДА НЕ ПИШИ PLACEHOLDER!**
    - НЕ пиши "информация будет позже"
    - НЕ пиши "данные будут добавлены"
    - НЕ пиши "TODO" или "..."
    - Пиши ТОЛЬКО реальные данные из результатов!
    - Если данных нет - сначала получи их!
 
-8. **ПРОВЕРКА РЕЗУЛЬТАТОВ**:
+9. **complete_task REQUIRES REAL RESULT**:
+   - "result" field must contain ACTUAL data (>10 chars)
+   - NOT just "Выполнено" or "Done"
+   - Include real information from the task!
+
+10. **ПРОВЕРКА РЕЗУЛЬТАТОВ**:
    - Если web_fetch вернул пустой результат - попробуй другой URL
    - Если нет данных - модифицируй план и добавь шаги для получения данных
    - НЕ считай задачу выполненной без реального результата!
 
-REMEMBER: Output ONLY valid JSON! Complete ALL tasks with REAL data!
+REMEMBER: Output ONLY valid JSON! USE COLLECTED DATA! Complete ALL tasks with REAL data!
 "#);
 
         prompt
@@ -513,6 +565,23 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks with REAL data!
             })
         });
 
+        // Parse complete_task - can be either object with task_id and result, or just a number
+        let complete_task = json.get("complete_task").and_then(|ct| {
+            if let Some(obj) = ct.as_object() {
+                Some(CompleteTaskRequest {
+                    task_id: obj.get("task_id")?.as_u64()? as usize,
+                    result: obj.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string(),
+                })
+            } else if let Some(id) = ct.as_u64() {
+                Some(CompleteTaskRequest {
+                    task_id: id as usize,
+                    result: String::new(),
+                })
+            } else {
+                None
+            }
+        });
+
         Some(ModelResponse {
             thought: json.get("thought").and_then(|v| v.as_str()).map(String::from),
             action: json.get("action").and_then(|v| v.as_str()).map(String::from),
@@ -523,7 +592,7 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks with REAL data!
             parallel_tasks,
             current_task: json.get("current_task").and_then(|v| v.as_u64()).map(|v| v as usize),
             add_tasks,
-            complete_task: json.get("complete_task").and_then(|v| v.as_u64()).map(|v| v as usize),
+            complete_task,
             fail_task,
             update_task,
         })
@@ -669,18 +738,25 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks with REAL data!
         let context = self.gather_context().await;
         debug!("System context: {}", &context);
 
+        let plan = Arc::new(RwLock::new(ExecutionPlan::default()));
+
         let mut messages = vec![
-            Message::system(self.system_prompt(&context)),
+            Message::system(self.system_prompt(&context, "")),
             Message::user(user_query),
         ];
 
         let mut steps: Vec<ReasoningStep> = Vec::new();
         let mut final_response: Option<String> = None;
         let max_steps = self.config.general.max_steps;
-        let plan = Arc::new(RwLock::new(ExecutionPlan::default()));
 
         for step_num in 1..=max_steps {
             debug!(step = step_num, "Executing step");
+
+            // Update system prompt with collected data from previous steps
+            let collected = plan.read().await.get_collected_context();
+            if !collected.is_empty() {
+                messages[0] = Message::system(self.system_prompt(&context, &collected));
+            }
 
             let response = self.provider.generate(&messages, None).await?;
             let response_text = response.content.clone().unwrap_or_default();
@@ -936,9 +1012,20 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks with REAL data!
                 }
 
                 Some("complete_task") => {
-                    if let Some(task_id) = parsed.complete_task {
+                    if let Some(ct) = &parsed.complete_task {
+                        // Validate that result is not empty or fake
+                        if ct.result.is_empty() || ct.result == "Выполнено" || ct.result == "Done" || ct.result.len() < 10 {
+                            messages.push(Message::assistant(&response_text));
+                            messages.push(Message::user(
+                                "❌ ОТКАЗАНО! complete_task требует РЕАЛЬНЫЙ результат в поле 'result'!\n\
+                                НЕ просто 'Выполнено' или 'Done'!\n\
+                                Включи настоящую информацию из задачи.\nОтветь JSON."
+                            ));
+                            continue;
+                        }
+
                         let mut p = plan.write().await;
-                        p.set_task_result(task_id, "Выполнено".to_string());
+                        p.set_task_result(ct.task_id, ct.result.clone());
                     }
 
                     step.plan = Some(plan.read().await.clone());

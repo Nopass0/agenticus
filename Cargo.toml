@@ -69,6 +69,10 @@ webbrowser = "1.0"
 # For running commands
 which = "6.0"
 
+# WebSocket for task queue
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = true

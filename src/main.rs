@@ -1,8 +1,10 @@
 mod agent;
 mod cli;
+mod coding_agent;
 mod config;
 mod llm;
 mod logging;
+mod task_queue;
 mod tools;
 
 use agent::Agent;
@@ -12,6 +14,7 @@ use config::Config;
 use llm::{OllamaProvider, OpenRouterProvider};
 use logging::InteractionLogger;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tools::memory::{create_shared_memory, register_memory_tools};
 use tools::ToolRegistry;
 use tracing::info;
@@ -29,6 +32,9 @@ fn create_tool_registry() -> ToolRegistry {
     tools::input::register_input_tools(&mut registry);
     tools::file_ops::register_file_tools(&mut registry);
     tools::utils::register_utils_tools(&mut registry);
+
+    // Register coding sub-agent tools
+    coding_agent::tool::register_coding_tools(&mut registry);
 
     // Register memory tools with shared memory
     let memory = create_shared_memory();
@@ -212,16 +218,151 @@ async fn run_chat_loop(
             print_step(step);
         }));
 
-    // Main chat loop
+    // Create task queue channel
+    let (task_tx, mut task_rx) = mpsc::channel::<task_queue::ServerTask>(32);
+
+    // Start task queue if configured
+    let task_queue_state = if config.server.enabled && !config.server.url.is_empty() {
+        print_info(&format!("Connecting to task server: {}", config.server.url));
+        let (_handle, state) = task_queue::spawn_task_queue(config.clone(), task_tx);
+        Some(state)
+    } else {
+        None
+    };
+
+    // Main chat loop with task queue support
     loop {
-        let input = match read_input() {
-            Some(s) if !s.is_empty() => s,
-            Some(_) => continue,
-            None => break,
+        // Check for server tasks (non-blocking)
+        let server_task = task_rx.try_recv().ok();
+
+        if let Some(task) = server_task {
+            // Process server task
+            println!(
+                "\n{} {} (ID: {})",
+                "[SERVER TASK]".bright_magenta().bold(),
+                task.task.bright_white(),
+                task.id.dimmed()
+            );
+            print_thinking();
+
+            let start_time = std::time::Instant::now();
+
+            match agent.run(&task.task).await {
+                Ok(log) => {
+                    clear_thinking();
+
+                    // Print final response
+                    if let Some(response) = &log.final_response {
+                        print_response(response);
+                    }
+
+                    let duration = start_time.elapsed().as_secs_f64();
+                    println!(
+                        "{} {} steps in {}",
+                        "Completed:".dimmed(),
+                        log.total_steps.to_string().bright_white(),
+                        format_duration(duration).bright_cyan()
+                    );
+
+                    // Send result back to server
+                    if let Some(state) = &task_queue_state {
+                        let _result = task_queue::TaskResult {
+                            task_id: task.id.clone(),
+                            success: true,
+                            result: log.final_response.clone().unwrap_or_default(),
+                            error: None,
+                            data: Some(serde_json::json!({
+                                "steps": log.total_steps,
+                                "duration_secs": duration
+                            })),
+                        };
+                        // Update state to mark task complete
+                        let mut s = state.write().await;
+                        s.current_task = None;
+                        // Note: Result sending happens through the client
+                        drop(s);
+                    }
+
+                    if let Err(e) = interaction_logger.log_interaction(&log) {
+                        tracing::warn!("Failed to log interaction: {}", e);
+                    }
+                }
+                Err(e) => {
+                    clear_thinking();
+                    print_error(&format!("{}", e));
+
+                    // Send error result back to server
+                    if let Some(state) = &task_queue_state {
+                        let mut s = state.write().await;
+                        s.current_task = None;
+                        drop(s);
+                    }
+                }
+            }
+
+            println!();
+            continue;
+        }
+
+        // Read user input (with timeout to check for server tasks)
+        let input = tokio::select! {
+            input = tokio::task::spawn_blocking(read_input) => {
+                match input {
+                    Ok(Some(s)) if !s.is_empty() => s,
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            // Check for server tasks every 100ms
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)), if task_queue_state.is_some() => {
+                continue;
+            }
         };
 
         // Handle commands
         if input.starts_with('/') {
+            // Add server status command
+            if input == "/server" || input == "/status" {
+                if let Some(state) = &task_queue_state {
+                    let s = state.read().await;
+                    println!("\n{}", "Server Connection Status:".bright_yellow().bold());
+                    println!("{}", "-".repeat(40).dimmed());
+                    println!(
+                        "  Connected: {}",
+                        if s.connected {
+                            "Yes".bright_green()
+                        } else {
+                            "No".bright_red()
+                        }
+                    );
+                    println!(
+                        "  Authenticated: {}",
+                        if s.authenticated {
+                            "Yes".bright_green()
+                        } else {
+                            "No".bright_red()
+                        }
+                    );
+                    println!(
+                        "  Pending tasks: {}",
+                        s.pending_tasks.len().to_string().bright_white()
+                    );
+                    println!(
+                        "  Current task: {}",
+                        s.current_task
+                            .as_ref()
+                            .map(|t| t.id.as_str())
+                            .unwrap_or("None")
+                            .bright_white()
+                    );
+                    println!();
+                } else {
+                    print_info("Server connection not configured.");
+                }
+                continue;
+            }
+
             if !handle_command(&input, &registry_arc, &config, &memory).await {
                 break;
             }

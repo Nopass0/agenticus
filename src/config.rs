@@ -15,6 +15,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +64,25 @@ pub struct MemoryConfig {
     pub file: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Enable connection to task server
+    #[serde(default)]
+    pub enabled: bool,
+    /// WebSocket server URL (e.g., "ws://server.example.com:8080/ws")
+    #[serde(default)]
+    pub url: String,
+    /// Authentication code for server connection
+    #[serde(default)]
+    pub auth_code: String,
+    /// Auto-reconnect on disconnect
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect: bool,
+    /// Reconnect interval in seconds
+    #[serde(default = "default_reconnect_interval")]
+    pub reconnect_interval: u64,
+}
+
 // Default functions
 fn default_provider() -> String {
     "openrouter".to_string()
@@ -101,6 +122,14 @@ fn default_log_level() -> String {
 
 fn default_memory_file() -> String {
     "memory.json".to_string()
+}
+
+fn default_auto_reconnect() -> bool {
+    true
+}
+
+fn default_reconnect_interval() -> u64 {
+    5
 }
 
 impl Default for GeneralConfig {
@@ -149,6 +178,18 @@ impl Default for MemoryConfig {
     }
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            auth_code: String::new(),
+            auto_reconnect: default_auto_reconnect(),
+            reconnect_interval: default_reconnect_interval(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -157,6 +198,7 @@ impl Default for Config {
             openrouter: OpenRouterConfig::default(),
             logging: LoggingConfig::default(),
             memory: MemoryConfig::default(),
+            server: ServerConfig::default(),
         }
     }
 }

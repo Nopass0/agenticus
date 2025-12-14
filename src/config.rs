@@ -72,7 +72,7 @@ fn default_language() -> String {
 }
 
 fn default_max_steps() -> usize {
-    10
+    25
 }
 
 fn default_ollama_url() -> String {

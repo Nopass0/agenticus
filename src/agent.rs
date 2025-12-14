@@ -102,7 +102,7 @@ You MUST respond with a JSON object. No other text outside JSON!
 When you need to use a tool:
 ```json
 {{
-  "thought": "краткое размышление о том что нужно сделать",
+  "thought": "ПЛАНИРОВАНИЕ: [общий план] | ТЕКУЩИЙ ШАГ: [что делаю сейчас] | ОСТАЛОСЬ: [что ещё нужно сделать]",
   "action": "use_tool",
   "tool": "tool_name",
   "args": {{"param1": "value1", "param2": "value2"}}
@@ -118,36 +118,58 @@ When you have the final answer:
 }}
 ```
 
-## RULES
+## CRITICAL RULES - FOLLOW STRICTLY!
 
-1. ALWAYS use tools when user asks about: time, system info, processes, web search, memory, etc.
-2. DO NOT ask permission - just use the tool!
-3. After getting tool result, analyze it and either use another tool or give final answer.
-4. ONLY output valid JSON, nothing else!
+1. **ПЛАНИРУЙ ПЕРЕД ДЕЙСТВИЕМ**: Перед первым шагом составь план в thought. Разбей задачу на подзадачи.
 
-## EXAMPLES
+2. **ВЫПОЛНЯЙ ЗАДАЧУ ПОЛНОСТЬЮ**:
+   - НЕ ОСТАНАВЛИВАЙСЯ на полпути!
+   - Если нашёл ссылки через web_search - ОБЯЗАТЕЛЬНО загрузи их через web_fetch чтобы получить реальный контент
+   - Если нужна дата/время - СНАЧАЛА вызови get_datetime
+   - Используй СТОЛЬКО шагов, СКОЛЬКО НУЖНО для полного решения
 
-User: "Который час?"
+3. **НЕ ДАВАЙ ЧАСТИЧНЫЕ ОТВЕТЫ**:
+   - ПЛОХО: "Вот ссылки на сайты где можно найти..."
+   - ХОРОШО: Реальный контент, данные, информация из источников
+
+4. **ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ АКТИВНО**:
+   - web_search: найти ссылки
+   - web_fetch: ОБЯЗАТЕЛЬНО загрузить контент найденных страниц!
+   - get_datetime: если контекст требует знания даты
+   - НЕ спрашивай разрешения - ДЕЙСТВУЙ!
+
+5. **АНАЛИЗИРУЙ РЕЗУЛЬТАТЫ**: После каждого инструмента думай: "Достаточно ли информации? Нужны ли ещё данные?"
+
+## ПРИМЕРЫ ПРАВИЛЬНОГО ПЛАНИРОВАНИЯ
+
+User: "Какие новые аниме вышли?"
 ```json
-{{"thought": "Нужно узнать время", "action": "use_tool", "tool": "get_datetime", "args": {{}}}}
+{{"thought": "ПЛАНИРОВАНИЕ: 1) Узнать текущую дату 2) Найти сайты с аниме 3) Загрузить контент 4) Извлечь список | ТЕКУЩИЙ ШАГ: Узнаю дату | ОСТАЛОСЬ: поиск, загрузка, анализ", "action": "use_tool", "tool": "get_datetime", "args": {{}}}}
+```
+После получения даты:
+```json
+{{"thought": "ПЛАНИРОВАНИЕ: продолжаю | ТЕКУЩИЙ ШАГ: Ищу сайты с аниме | ОСТАЛОСЬ: загрузить контент, извлечь список", "action": "use_tool", "tool": "web_search", "args": {{"query": "новые аниме декабрь 2024 список"}}}}
+```
+После поиска:
+```json
+{{"thought": "ПЛАНИРОВАНИЕ: продолжаю | ТЕКУЩИЙ ШАГ: Загружаю контент первого сайта | ОСТАЛОСЬ: возможно загрузить ещё, сформировать ответ", "action": "use_tool", "tool": "web_fetch", "args": {{"url": "https://example.com/anime-list"}}}}
 ```
 
-User: "Открой блокнот"
+User: "Открой блокнот и напиши там привет"
 ```json
-{{"thought": "Нужно запустить notepad", "action": "use_tool", "tool": "launch_app", "args": {{"app": "notepad"}}}}
+{{"thought": "ПЛАНИРОВАНИЕ: 1) Открыть блокнот 2) Подождать 3) Ввести текст | ТЕКУЩИЙ ШАГ: Открываю блокнот | ОСТАЛОСЬ: ввести текст", "action": "use_tool", "tool": "launch_app", "args": {{"app": "notepad"}}}}
+```
+После открытия:
+```json
+{{"thought": "ПЛАНИРОВАНИЕ: продолжаю | ТЕКУЩИЙ ШАГ: Ввожу текст | ОСТАЛОСЬ: ничего", "action": "use_tool", "tool": "type_text", "args": {{"text": "привет"}}}}
 ```
 
-User: "Какие процессы запущены?"
-```json
-{{"thought": "Покажу список процессов", "action": "use_tool", "tool": "list_processes", "args": {{"limit": 20}}}}
-```
+## ВАЖНО
 
-User: "Запомни что меня зовут Иван"
-```json
-{{"thought": "Сохраню имя в память", "action": "use_tool", "tool": "memory_save", "args": {{"key": "user_name", "value": "Иван"}}}}
-```
-
-IMPORTANT: Output ONLY valid JSON! No markdown, no explanations outside JSON!"#
+- НИКОГДА не давай final_answer пока задача не решена ПОЛНОСТЬЮ
+- Если web_search дал ссылки - ЗАГРУЗИ их через web_fetch!
+- Если задача требует нескольких действий - ВЫПОЛНИ ИХ ВСЕ
+- Output ONLY valid JSON! No markdown, no explanations outside JSON!"#
         )
     }
 
@@ -309,7 +331,7 @@ IMPORTANT: Output ONLY valid JSON! No markdown, no explanations outside JSON!"#
                     // Add to conversation for next iteration
                     messages.push(Message::assistant(&response_text));
                     messages.push(Message::user(&format!(
-                        "Tool result for {}:\n{}\n\nAnalyze the result and respond with JSON. Either use another tool or provide final answer.",
+                        "Tool result for {}:\n{}\n\nПРОДОЛЖАЙ ВЫПОЛНЕНИЕ ПЛАНА! Проанализируй результат:\n- Задача решена ПОЛНОСТЬЮ? Если да - дай final_answer с полным ответом.\n- Нужны ещё данные? Используй следующий инструмент по плану.\n- Если web_search вернул ссылки - ЗАГРУЗИ контент через web_fetch!\nОтветь JSON.",
                         tool_name, result_str
                     )));
                 }

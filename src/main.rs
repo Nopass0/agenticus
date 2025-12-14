@@ -26,6 +26,7 @@ fn create_tool_registry() -> ToolRegistry {
     tools::api::register_api_tools(&mut registry);
     tools::processes::register_process_tools(&mut registry);
     tools::screenshot::register_screenshot_tools(&mut registry);
+    tools::input::register_input_tools(&mut registry);
 
     // Register memory tools with shared memory
     let memory = create_shared_memory();

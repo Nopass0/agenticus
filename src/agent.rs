@@ -18,7 +18,7 @@ pub enum TaskStatus {
     InProgress,
     Completed,
     Failed,
-    Parallel,  // Task is being executed by a sub-agent
+    Parallel,
 }
 
 /// A single task in the plan
@@ -65,9 +65,29 @@ impl ExecutionPlan {
         id
     }
 
+    pub fn insert_task_after(&mut self, after_id: usize, description: &str, can_parallelize: bool) -> usize {
+        let new_id = self.tasks.len() + 1;
+        let pos = self.tasks.iter().position(|t| t.id == after_id).map(|p| p + 1).unwrap_or(self.tasks.len());
+        self.tasks.insert(pos, PlanTask {
+            id: new_id,
+            description: description.to_string(),
+            status: TaskStatus::Pending,
+            subtasks: Vec::new(),
+            result: None,
+            can_parallelize,
+        });
+        new_id
+    }
+
     pub fn update_task_status(&mut self, id: usize, status: TaskStatus) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             task.status = status;
+        }
+    }
+
+    pub fn update_task_description(&mut self, id: usize, description: &str) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+            task.description = description.to_string();
         }
     }
 
@@ -78,19 +98,42 @@ impl ExecutionPlan {
         }
     }
 
-    pub fn get_next_pending(&self) -> Option<&PlanTask> {
-        self.tasks.iter().find(|t| t.status == TaskStatus::Pending)
+    pub fn fail_task(&mut self, id: usize, error: String) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+            task.result = Some(error);
+            task.status = TaskStatus::Failed;
+        }
     }
 
-    pub fn get_parallelizable_tasks(&self) -> Vec<&PlanTask> {
-        self.tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Pending && t.can_parallelize)
-            .collect()
+    pub fn get_pending_tasks(&self) -> Vec<&PlanTask> {
+        self.tasks.iter().filter(|t| t.status == TaskStatus::Pending).collect()
+    }
+
+    pub fn get_incomplete_tasks(&self) -> Vec<&PlanTask> {
+        self.tasks.iter().filter(|t| t.status != TaskStatus::Completed).collect()
     }
 
     pub fn all_completed(&self) -> bool {
-        self.tasks.iter().all(|t| t.status == TaskStatus::Completed || t.status == TaskStatus::Failed)
+        self.tasks.iter().all(|t| t.status == TaskStatus::Completed)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.tasks.iter().any(|t| t.status == TaskStatus::Pending)
+    }
+
+    pub fn format_status(&self) -> String {
+        let mut s = String::new();
+        for t in &self.tasks {
+            let icon = match t.status {
+                TaskStatus::Completed => "✅",
+                TaskStatus::Failed => "❌",
+                TaskStatus::InProgress => "🔄",
+                TaskStatus::Parallel => "⚡",
+                TaskStatus::Pending => "⏳",
+            };
+            s.push_str(&format!("{} [{}] {}\n", icon, t.id, t.description));
+        }
+        s
     }
 }
 
@@ -140,25 +183,23 @@ pub struct InteractionLog {
 }
 
 /// Parsed response from model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ModelResponse {
-    #[serde(default)]
     thought: Option<String>,
-    #[serde(default)]
     action: Option<String>,
-    #[serde(default)]
     tool: Option<String>,
-    #[serde(default)]
     args: Option<Value>,
-    #[serde(default)]
     answer: Option<String>,
-    #[serde(default)]
     plan: Option<PlanResponse>,
-    #[serde(default)]
     parallel_tasks: Option<Vec<ParallelTaskRequest>>,
+    current_task: Option<usize>,
+    // Plan modification fields
+    add_tasks: Option<Vec<TaskResponse>>,
+    complete_task: Option<usize>,
+    fail_task: Option<FailTaskRequest>,
+    update_task: Option<UpdateTaskRequest>,
 }
 
-/// Plan structure from model response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanResponse {
     goal: String,
@@ -179,10 +220,20 @@ struct ParallelTaskRequest {
     args: Value,
 }
 
-/// Callback for step updates
-pub type StepCallback = Box<dyn Fn(&ReasoningStep) + Send + Sync>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailTaskRequest {
+    task_id: usize,
+    reason: String,
+}
 
-/// Callback for plan updates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateTaskRequest {
+    task_id: usize,
+    description: String,
+}
+
+/// Callback types
+pub type StepCallback = Box<dyn Fn(&ReasoningStep) + Send + Sync>;
 pub type PlanCallback = Box<dyn Fn(&ExecutionPlan) + Send + Sync>;
 
 /// The main AI agent
@@ -219,142 +270,165 @@ impl Agent {
         self
     }
 
-    /// Create the system prompt with JSON response format
-    fn system_prompt(&self) -> String {
+    /// Gather system context (date/time, OS info, owner from memory)
+    async fn gather_context(&self) -> String {
+        let mut context_parts = Vec::new();
+
+        // Get current date/time
+        if let Ok(result) = self.registry.execute("get_datetime", serde_json::json!({})).await {
+            if result.success {
+                context_parts.push(format!("📅 Текущая дата и время: {}", result.output.trim()));
+            }
+        }
+
+        // Get system info
+        if let Ok(result) = self.registry.execute("get_system_info", serde_json::json!({})).await {
+            if result.success {
+                context_parts.push(format!("💻 Системная информация:\n{}", result.output.trim()));
+            }
+        }
+
+        // Try to get owner info from memory
+        if let Ok(result) = self.registry.execute("memory_recall", serde_json::json!({"key": "owner"})).await {
+            if result.success && !result.output.contains("not found") && !result.output.is_empty() {
+                context_parts.push(format!("👤 Владелец: {}", result.output.trim()));
+            }
+        }
+
+        // Try to get user name from memory
+        if let Ok(result) = self.registry.execute("memory_recall", serde_json::json!({"key": "user_name"})).await {
+            if result.success && !result.output.contains("not found") && !result.output.is_empty() {
+                context_parts.push(format!("👤 Имя пользователя: {}", result.output.trim()));
+            }
+        }
+
+        // Try to get preferences from memory
+        if let Ok(result) = self.registry.execute("memory_recall", serde_json::json!({"key": "preferences"})).await {
+            if result.success && !result.output.contains("not found") && !result.output.is_empty() {
+                context_parts.push(format!("⚙️ Предпочтения: {}", result.output.trim()));
+            }
+        }
+
+        if context_parts.is_empty() {
+            String::new()
+        } else {
+            format!("## ТЕКУЩИЙ КОНТЕКСТ\n\n{}\n\n---\n\n", context_parts.join("\n\n"))
+        }
+    }
+
+    fn system_prompt(&self, context: &str) -> String {
         let tools_desc = self.registry.format_for_prompt();
         let language = &self.config.general.language;
 
-        format!(
-            r#"You are Agenticus, a powerful AI assistant with access to various tools.
-You MUST respond in {language}.
+        let mut prompt = String::new();
 
-{tools_desc}
+        // Add context if present
+        prompt.push_str(context);
 
-## RESPONSE FORMAT
+        // Main instructions
+        prompt.push_str(&format!(
+            "You are Agenticus, a powerful AI assistant that ALWAYS completes tasks fully.\n\
+            You MUST respond in {}.\n\n\
+            {}\n\n",
+            language, tools_desc
+        ));
 
-You MUST respond with a JSON object. No other text outside JSON!
+        // Response format - using raw string to avoid escaping issues
+        prompt.push_str(r#"## RESPONSE FORMAT - ONLY JSON!
 
-### First response - Create a plan:
+### 1. Create initial plan (ALWAYS first):
 ```json
-{{
-  "thought": "Анализ задачи",
+{
+  "thought": "Analyzing task and creating plan",
   "action": "create_plan",
-  "plan": {{
-    "goal": "Описание конечной цели",
+  "plan": {
+    "goal": "End goal description",
     "tasks": [
-      {{"description": "Задача 1", "can_parallelize": false}},
-      {{"description": "Задача 2 (можно параллельно)", "can_parallelize": true}},
-      {{"description": "Задача 3 (можно параллельно)", "can_parallelize": true}},
-      {{"description": "Задача 4 - обработка результатов", "can_parallelize": false}}
+      {"description": "Task 1", "can_parallelize": false},
+      {"description": "Task 2", "can_parallelize": true}
     ]
-  }}
-}}
+  }
+}
 ```
 
-### Execute a single tool:
+### 2. Execute tool for a specific task:
 ```json
-{{
-  "thought": "Выполняю задачу N",
+{
+  "thought": "Executing task N",
   "action": "use_tool",
+  "current_task": 1,
   "tool": "tool_name",
-  "args": {{"param": "value"}},
-  "current_task": 1
-}}
+  "args": {"param": "value"}
+}
 ```
 
-### Execute multiple tools in parallel (for parallelizable tasks):
+### 3. Execute parallel tasks:
 ```json
-{{
-  "thought": "Запускаю параллельные задачи",
+{
+  "thought": "Running parallel tasks",
   "action": "parallel_execute",
   "parallel_tasks": [
-    {{"task_id": 2, "tool": "web_fetch", "args": {{"url": "https://site1.com"}}}},
-    {{"task_id": 3, "tool": "web_fetch", "args": {{"url": "https://site2.com"}}}}
+    {"task_id": 2, "tool": "web_fetch", "args": {"url": "..."}},
+    {"task_id": 3, "tool": "web_fetch", "args": {"url": "..."}}
   ]
-}}
+}
 ```
 
-### Final answer:
+### 4. Modify plan (add new tasks):
 ```json
-{{
-  "thought": "Итог выполнения",
-  "action": "final_answer",
-  "answer": "Полный ответ пользователю"
-}}
-```
-
-## CRITICAL RULES
-
-1. **ВСЕГДА НАЧИНАЙ С ПЛАНА**: Первый ответ должен содержать action: "create_plan" с подробным списком задач.
-
-2. **ИСПОЛЬЗУЙ ПАРАЛЛЕЛЬНОЕ ВЫПОЛНЕНИЕ**: Если несколько задач можно выполнить одновременно (например, загрузить несколько страниц), помечай их can_parallelize: true и используй action: "parallel_execute".
-
-3. **ВЫПОЛНЯЙ ВСЕ ЗАДАЧИ**: Не останавливайся пока все задачи плана не выполнены.
-
-4. **web_search -> web_fetch**: После поиска ОБЯЗАТЕЛЬНО загружай найденные страницы.
-
-5. **КОНКРЕТНЫЙ РЕЗУЛЬТАТ**: В final_answer давай реальные данные, не ссылки.
-
-## EXAMPLE: Finding latest anime
-
-User: "Найди топ 5 последних аниме"
-
-Step 1 - Create plan:
-```json
-{{
-  "thought": "Нужно найти актуальную информацию об аниме",
-  "action": "create_plan",
-  "plan": {{
-    "goal": "Найти и вернуть топ 5 последних вышедших аниме",
-    "tasks": [
-      {{"description": "Узнать текущую дату", "can_parallelize": false}},
-      {{"description": "Найти сайты с аниме-релизами", "can_parallelize": false}},
-      {{"description": "Загрузить контент с первого сайта", "can_parallelize": true}},
-      {{"description": "Загрузить контент со второго сайта", "can_parallelize": true}},
-      {{"description": "Проанализировать и составить список", "can_parallelize": false}}
-    ]
-  }}
-}}
-```
-
-Step 2 - Get date:
-```json
-{{"thought": "Выполняю задачу 1", "action": "use_tool", "tool": "get_datetime", "args": {{}}, "current_task": 1}}
-```
-
-Step 3 - Search:
-```json
-{{"thought": "Выполняю задачу 2", "action": "use_tool", "tool": "web_search", "args": {{"query": "новые аниме декабрь 2024"}}, "current_task": 2}}
-```
-
-Step 4 - Parallel fetch:
-```json
-{{
-  "thought": "Запускаю параллельную загрузку",
-  "action": "parallel_execute",
-  "parallel_tasks": [
-    {{"task_id": 3, "tool": "web_fetch", "args": {{"url": "https://example1.com/anime"}}}},
-    {{"task_id": 4, "tool": "web_fetch", "args": {{"url": "https://example2.com/releases"}}}}
+{
+  "thought": "Need to add tasks to plan",
+  "action": "modify_plan",
+  "add_tasks": [
+    {"description": "New task", "can_parallelize": false}
   ]
-}}
+}
 ```
 
-## IMPORTANT
-- Output ONLY valid JSON!
-- ALWAYS create a plan first
-- Use parallel_execute when multiple tasks can run simultaneously
-- Complete ALL tasks before final_answer"#
-        )
+### 5. Mark task as complete/failed:
+```json
+{"thought": "Task done", "action": "complete_task", "complete_task": 1}
+```
+```json
+{"thought": "Task failed", "action": "fail_task", "fail_task": {"task_id": 1, "reason": "Error reason"}}
+```
+
+### 6. Final answer (ONLY when ALL tasks are done):
+```json
+{"thought": "All tasks completed", "action": "final_answer", "answer": "Full result"}
+```
+
+## CRITICAL RULES:
+
+1. **START WITH PLAN**: First response = create_plan
+
+2. **SPECIFY current_task**: When using use_tool, ALWAYS specify task number
+
+3. **NO final_answer UNTIL ALL TASKS ARE DONE!**
+   - Check status: pending, in_progress, completed, failed
+   - final_answer ONLY when ALL tasks = completed
+
+4. **MODIFY PLAN**: If needed - add new tasks via modify_plan
+
+5. **WEB SEQUENCE**:
+   - web_search -> find links
+   - web_fetch -> load content (REQUIRED!)
+   - write_file -> save file
+   - open_with_default -> open
+
+6. **PARALLELISM**: Use parallel_execute for multiple web_fetch
+
+REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
+"#);
+
+        prompt
     }
 
-    /// Extract JSON from response text
     fn extract_json(&self, text: &str) -> Option<Value> {
-        // Try to parse directly
         if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
             return Some(v);
         }
 
-        // Try to find JSON in code blocks
         let re = Regex::new(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```").ok()?;
         if let Some(caps) = re.captures(text) {
             if let Ok(v) = serde_json::from_str::<Value>(&caps[1]) {
@@ -362,7 +436,6 @@ Step 4 - Parallel fetch:
             }
         }
 
-        // Try to find raw JSON object
         let re2 = Regex::new(r"\{[\s\S]*\}").ok()?;
         if let Some(m) = re2.find(text) {
             if let Ok(v) = serde_json::from_str::<Value>(m.as_str()) {
@@ -373,7 +446,6 @@ Step 4 - Parallel fetch:
         None
     }
 
-    /// Parse model response
     fn parse_response(&self, text: &str) -> Option<ModelResponse> {
         let json = self.extract_json(text)?;
 
@@ -383,12 +455,10 @@ Step 4 - Parallel fetch:
                 tasks: p.get("tasks")?
                     .as_array()?
                     .iter()
-                    .filter_map(|t| {
-                        Some(TaskResponse {
-                            description: t.get("description")?.as_str()?.to_string(),
-                            can_parallelize: t.get("can_parallelize").and_then(|v| v.as_bool()).unwrap_or(false),
-                        })
-                    })
+                    .filter_map(|t| Some(TaskResponse {
+                        description: t.get("description")?.as_str()?.to_string(),
+                        can_parallelize: t.get("can_parallelize").and_then(|v| v.as_bool()).unwrap_or(false),
+                    }))
                     .collect(),
             })
         });
@@ -396,14 +466,37 @@ Step 4 - Parallel fetch:
         let parallel_tasks = json.get("parallel_tasks").and_then(|pt| {
             pt.as_array().map(|arr| {
                 arr.iter()
-                    .filter_map(|t| {
-                        Some(ParallelTaskRequest {
-                            task_id: t.get("task_id")?.as_u64()? as usize,
-                            tool: t.get("tool")?.as_str()?.to_string(),
-                            args: t.get("args").cloned().unwrap_or(Value::Object(serde_json::Map::new())),
-                        })
-                    })
+                    .filter_map(|t| Some(ParallelTaskRequest {
+                        task_id: t.get("task_id")?.as_u64()? as usize,
+                        tool: t.get("tool")?.as_str()?.to_string(),
+                        args: t.get("args").cloned().unwrap_or(Value::Object(serde_json::Map::new())),
+                    }))
                     .collect()
+            })
+        });
+
+        let add_tasks = json.get("add_tasks").and_then(|at| {
+            at.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|t| Some(TaskResponse {
+                        description: t.get("description")?.as_str()?.to_string(),
+                        can_parallelize: t.get("can_parallelize").and_then(|v| v.as_bool()).unwrap_or(false),
+                    }))
+                    .collect()
+            })
+        });
+
+        let fail_task = json.get("fail_task").and_then(|ft| {
+            Some(FailTaskRequest {
+                task_id: ft.get("task_id")?.as_u64()? as usize,
+                reason: ft.get("reason")?.as_str()?.to_string(),
+            })
+        });
+
+        let update_task = json.get("update_task").and_then(|ut| {
+            Some(UpdateTaskRequest {
+                task_id: ut.get("task_id")?.as_u64()? as usize,
+                description: ut.get("description")?.as_str()?.to_string(),
             })
         });
 
@@ -415,10 +508,14 @@ Step 4 - Parallel fetch:
             answer: json.get("answer").and_then(|v| v.as_str()).map(String::from),
             plan,
             parallel_tasks,
+            current_task: json.get("current_task").and_then(|v| v.as_u64()).map(|v| v as usize),
+            add_tasks,
+            complete_task: json.get("complete_task").and_then(|v| v.as_u64()).map(|v| v as usize),
+            fail_task,
+            update_task,
         })
     }
 
-    /// Execute parallel tasks using sub-agents
     async fn execute_parallel_tasks(
         &self,
         tasks: Vec<ParallelTaskRequest>,
@@ -432,13 +529,11 @@ Step 4 - Parallel fetch:
             let tool_name = task.tool.clone();
             let args = task.args.clone();
 
-            // Update plan status
             {
                 let mut p = plan.write().await;
                 p.update_task_status(task_id, TaskStatus::Parallel);
             }
 
-            // Spawn parallel task
             let handle = tokio::spawn(async move {
                 let result = registry.execute(&tool_name, args).await;
                 match result {
@@ -460,17 +555,15 @@ Step 4 - Parallel fetch:
             handles.push(handle);
         }
 
-        // Wait for all parallel tasks to complete
         let mut results = Vec::new();
         for handle in handles {
             if let Ok(result) = handle.await {
-                // Update plan with result
                 {
                     let mut p = plan.write().await;
                     if result.success {
                         p.set_task_result(result.task_id, result.result.clone());
                     } else {
-                        p.update_task_status(result.task_id, TaskStatus::Failed);
+                        p.fail_task(result.task_id, result.result.clone());
                     }
                 }
                 results.push(result);
@@ -480,19 +573,38 @@ Step 4 - Parallel fetch:
         results
     }
 
-    /// Run the agent on a user query
+    fn build_status_message(plan: &ExecutionPlan) -> String {
+        let pending = plan.get_pending_tasks();
+        let incomplete = plan.get_incomplete_tasks();
+
+        if plan.all_completed() {
+            "✅ ВСЕ ЗАДАЧИ ВЫПОЛНЕНЫ! Теперь можешь дать final_answer.".to_string()
+        } else if pending.is_empty() && !incomplete.is_empty() {
+            format!(
+                "⚠️ Есть незавершённые задачи:\n{}\nВыполни их или пометь как failed.",
+                incomplete.iter().map(|t| format!("  - [{}] {}", t.id, t.description)).collect::<Vec<_>>().join("\n")
+            )
+        } else {
+            format!(
+                "📋 Статус плана:\n{}\n⏳ Ожидающие задачи: {}\nПродолжай выполнение!",
+                plan.format_status(),
+                pending.iter().map(|t| format!("[{}]", t.id)).collect::<Vec<_>>().join(", ")
+            )
+        }
+    }
+
     pub async fn run(&self, user_query: &str) -> Result<InteractionLog> {
         let interaction_id = uuid::Uuid::new_v4().to_string();
         let start_time = Utc::now();
 
-        info!(
-            interaction_id = %interaction_id,
-            query = %user_query,
-            "Starting agent run"
-        );
+        info!(interaction_id = %interaction_id, query = %user_query, "Starting agent run");
+
+        // Gather system context (date/time, OS info, owner from memory)
+        let context = self.gather_context().await;
+        debug!("System context: {}", &context);
 
         let mut messages = vec![
-            Message::system(self.system_prompt()),
+            Message::system(self.system_prompt(&context)),
             Message::user(user_query),
         ];
 
@@ -504,38 +616,20 @@ Step 4 - Parallel fetch:
         for step_num in 1..=max_steps {
             debug!(step = step_num, "Executing step");
 
-            // Get LLM response
             let response = self.provider.generate(&messages, None).await?;
-
             let response_text = response.content.clone().unwrap_or_default();
             debug!("Raw response: {}", &response_text);
 
-            // Parse JSON response
             let parsed = match self.parse_response(&response_text) {
                 Some(p) => p,
                 None => {
-                    warn!("Could not parse JSON response, treating as final answer");
-                    let step = ReasoningStep {
-                        step_number: step_num,
-                        timestamp: Utc::now().to_rfc3339(),
-                        thought: None,
-                        tool_call: None,
-                        tool_result: None,
-                        is_final: true,
-                        plan: Some(plan.read().await.clone()),
-                        parallel_results: Vec::new(),
-                    };
-
-                    if let Some(ref callback) = self.step_callback {
-                        callback(&step);
-                    }
-                    steps.push(step);
-                    final_response = Some(response_text);
-                    break;
+                    warn!("Could not parse JSON response");
+                    messages.push(Message::assistant(&response_text));
+                    messages.push(Message::user("Ошибка: твой ответ не JSON. Ответь ТОЛЬКО JSON!"));
+                    continue;
                 }
             };
 
-            // Create step record
             let mut step = ReasoningStep {
                 step_number: step_num,
                 timestamp: Utc::now().to_rfc3339(),
@@ -547,7 +641,6 @@ Step 4 - Parallel fetch:
                 parallel_results: Vec::new(),
             };
 
-            // Handle different actions
             match parsed.action.as_deref() {
                 Some("create_plan") => {
                     if let Some(plan_resp) = &parsed.plan {
@@ -560,20 +653,20 @@ Step 4 - Parallel fetch:
 
                         step.plan = Some(plan.read().await.clone());
 
-                        // Notify plan callback
                         if let Some(ref callback) = self.plan_callback {
                             callback(&*plan.read().await);
                         }
-
                         if let Some(ref callback) = self.step_callback {
                             callback(&step);
                         }
                         steps.push(step);
 
+                        let status = Self::build_status_message(&*plan.read().await);
                         messages.push(Message::assistant(&response_text));
-                        messages.push(Message::user(
-                            "План создан. Теперь выполняй задачи по порядку. Используй parallel_execute для задач с can_parallelize: true когда они идут подряд. Ответь JSON."
-                        ));
+                        messages.push(Message::user(&format!(
+                            "План создан!\n{}\nВыполняй задачи по порядку, указывая current_task. Ответь JSON.",
+                            status
+                        )));
                     }
                 }
 
@@ -581,18 +674,21 @@ Step 4 - Parallel fetch:
                     let tool_name = match &parsed.tool {
                         Some(t) => t.clone(),
                         None => {
-                            warn!("No tool specified in use_tool action");
-                            step.is_final = true;
-                            final_response = Some("Ошибка: не указан инструмент".to_string());
-                            if let Some(ref callback) = self.step_callback {
-                                callback(&step);
-                            }
-                            steps.push(step);
-                            break;
+                            messages.push(Message::assistant(&response_text));
+                            messages.push(Message::user("Ошибка: не указан tool. Укажи tool и args."));
+                            continue;
                         }
                     };
 
+                    let current_task = parsed.current_task;
                     let args = parsed.args.clone().unwrap_or(Value::Object(serde_json::Map::new()));
+
+                    // Mark task as in progress
+                    if let Some(task_id) = current_task {
+                        let mut p = plan.write().await;
+                        p.update_task_status(task_id, TaskStatus::InProgress);
+                        p.current_task_id = Some(task_id);
+                    }
 
                     info!(tool = %tool_name, args = %args, "Executing tool");
 
@@ -601,14 +697,35 @@ Step 4 - Parallel fetch:
                         arguments: args.clone(),
                     });
 
-                    // Execute the tool
                     let result = self.registry.execute(&tool_name, args).await?;
 
                     let result_str = if result.success {
-                        result.output
+                        result.output.clone()
                     } else {
-                        format!("Error: {}", result.error.unwrap_or_default())
+                        format!("Error: {}", result.error.clone().unwrap_or_default())
                     };
+
+                    // Mark task as completed or failed
+                    if let Some(task_id) = current_task {
+                        let mut p = plan.write().await;
+                        if result.success {
+                            // Truncate result for storage (UTF-8 safe)
+                            let short_result = if result_str.len() > 200 {
+                                let truncate_at = result_str
+                                    .char_indices()
+                                    .take_while(|(i, _)| *i < 200)
+                                    .last()
+                                    .map(|(i, c)| i + c.len_utf8())
+                                    .unwrap_or(0);
+                                format!("{}...", &result_str[..truncate_at])
+                            } else {
+                                result_str.clone()
+                            };
+                            p.set_task_result(task_id, short_result);
+                        } else {
+                            p.fail_task(task_id, result_str.clone());
+                        }
+                    }
 
                     step.tool_result = Some(result_str.clone());
                     step.plan = Some(plan.read().await.clone());
@@ -620,10 +737,11 @@ Step 4 - Parallel fetch:
                     }
                     steps.push(step);
 
+                    let status = Self::build_status_message(&*plan.read().await);
                     messages.push(Message::assistant(&response_text));
                     messages.push(Message::user(&format!(
-                        "Результат {}:\n{}\n\nПродолжай выполнение плана. Если есть параллельные задачи - используй parallel_execute. Ответь JSON.",
-                        tool_name, result_str
+                        "Результат {}:\n{}\n\n{}\nОтветь JSON.",
+                        tool_name, result_str, status
                     )));
                 }
 
@@ -636,38 +754,119 @@ Step 4 - Parallel fetch:
                         step.parallel_results = results.clone();
                         step.plan = Some(plan.read().await.clone());
 
-                        // Notify plan callback
                         if let Some(ref callback) = self.plan_callback {
                             callback(&*plan.read().await);
                         }
-
                         if let Some(ref callback) = self.step_callback {
                             callback(&step);
                         }
                         steps.push(step);
 
-                        // Build consolidated results message
-                        let mut results_text = String::from("Результаты параллельного выполнения:\n\n");
+                        let mut results_text = String::from("Результаты параллельного выполнения:\n");
                         for r in &results {
+                            // UTF-8 safe truncation
+                            let short_result = if r.result.len() > 300 {
+                                let truncate_at = r.result
+                                    .char_indices()
+                                    .take_while(|(i, _)| *i < 300)
+                                    .last()
+                                    .map(|(i, c)| i + c.len_utf8())
+                                    .unwrap_or(0);
+                                format!("{}...", &r.result[..truncate_at])
+                            } else {
+                                r.result.clone()
+                            };
                             results_text.push_str(&format!(
-                                "=== Задача {} ({}) ===\n{}: {}\n{}\n\n",
+                                "\n[{}] {}: {}\n{}\n",
                                 r.task_id,
+                                if r.success { "✅" } else { "❌" },
                                 r.task_description,
-                                if r.success { "Успех" } else { "Ошибка" },
-                                r.task_description,
-                                r.result
+                                short_result
                             ));
                         }
 
+                        let status = Self::build_status_message(&*plan.read().await);
                         messages.push(Message::assistant(&response_text));
                         messages.push(Message::user(&format!(
-                            "{}\nПродолжай выполнение оставшихся задач плана или дай final_answer если всё готово. Ответь JSON.",
-                            results_text
+                            "{}\n\n{}\nОтветь JSON.",
+                            results_text, status
                         )));
                     }
                 }
 
+                Some("modify_plan") => {
+                    if let Some(add_tasks) = &parsed.add_tasks {
+                        let mut p = plan.write().await;
+                        for task in add_tasks {
+                            p.add_task(&task.description, task.can_parallelize);
+                        }
+                    }
+
+                    step.plan = Some(plan.read().await.clone());
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
+                    }
+                    steps.push(step);
+
+                    let status = Self::build_status_message(&*plan.read().await);
+                    messages.push(Message::assistant(&response_text));
+                    messages.push(Message::user(&format!(
+                        "План обновлён!\n{}\nПродолжай выполнение. Ответь JSON.",
+                        status
+                    )));
+                }
+
+                Some("complete_task") => {
+                    if let Some(task_id) = parsed.complete_task {
+                        let mut p = plan.write().await;
+                        p.set_task_result(task_id, "Выполнено".to_string());
+                    }
+
+                    step.plan = Some(plan.read().await.clone());
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
+                    }
+                    steps.push(step);
+
+                    let status = Self::build_status_message(&*plan.read().await);
+                    messages.push(Message::assistant(&response_text));
+                    messages.push(Message::user(&format!("{}\nОтветь JSON.", status)));
+                }
+
+                Some("fail_task") => {
+                    if let Some(ft) = &parsed.fail_task {
+                        let mut p = plan.write().await;
+                        p.fail_task(ft.task_id, ft.reason.clone());
+                    }
+
+                    step.plan = Some(plan.read().await.clone());
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
+                    }
+                    steps.push(step);
+
+                    let status = Self::build_status_message(&*plan.read().await);
+                    messages.push(Message::assistant(&response_text));
+                    messages.push(Message::user(&format!("{}\nОтветь JSON.", status)));
+                }
+
                 Some("final_answer") => {
+                    let p = plan.read().await;
+
+                    // Check if all tasks are complete
+                    if !p.all_completed() && p.has_pending() {
+                        let pending: Vec<_> = p.get_pending_tasks().iter().map(|t| format!("[{}] {}", t.id, t.description)).collect();
+                        drop(p);
+
+                        messages.push(Message::assistant(&response_text));
+                        messages.push(Message::user(&format!(
+                            "❌ НЕЛЬЗЯ дать final_answer! Есть невыполненные задачи:\n{}\n\nВыполни их сначала! Ответь JSON.",
+                            pending.join("\n")
+                        )));
+                        continue;
+                    }
+                    drop(p);
+
                     step.is_final = true;
                     step.plan = Some(plan.read().await.clone());
                     final_response = parsed.answer.or(parsed.thought);
@@ -680,42 +879,22 @@ Step 4 - Parallel fetch:
                 }
 
                 _ => {
-                    step.is_final = true;
-                    step.plan = Some(plan.read().await.clone());
-                    final_response = parsed.answer.or(parsed.thought).or(Some(response_text));
-
-                    if let Some(ref callback) = self.step_callback {
-                        callback(&step);
-                    }
-                    steps.push(step);
-                    break;
+                    messages.push(Message::assistant(&response_text));
+                    messages.push(Message::user(
+                        "Неизвестное действие. Используй: create_plan, use_tool, parallel_execute, modify_plan, complete_task, fail_task, final_answer. Ответь JSON."
+                    ));
+                    continue;
                 }
             }
         }
 
-        // If we hit max steps without a final response
         if final_response.is_none() && steps.len() >= max_steps {
             warn!("Reached maximum steps without final response");
             let p = plan.read().await;
             final_response = Some(format!(
-                "Достиг максимального количества шагов ({}).\n\nВыполненные задачи:\n{}",
+                "Достиг максимального количества шагов ({}).\n\nСтатус плана:\n{}",
                 max_steps,
-                p.tasks
-                    .iter()
-                    .map(|t| format!(
-                        "{} {} - {}",
-                        match t.status {
-                            TaskStatus::Completed => "✓",
-                            TaskStatus::Failed => "✗",
-                            TaskStatus::InProgress => "⟳",
-                            TaskStatus::Parallel => "⇆",
-                            TaskStatus::Pending => "○",
-                        },
-                        t.description,
-                        t.result.as_deref().unwrap_or("нет результата")
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                p.format_status()
             ));
         }
 
@@ -730,11 +909,7 @@ Step 4 - Parallel fetch:
             plan: Some(plan.read().await.clone()),
         };
 
-        info!(
-            steps = log.total_steps,
-            success = log.success,
-            "Agent run complete"
-        );
+        info!(steps = log.total_steps, success = log.success, "Agent run complete");
 
         Ok(log)
     }

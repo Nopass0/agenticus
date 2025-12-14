@@ -1,7 +1,7 @@
 use crate::agent::InteractionLog;
 use crate::config::Config;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;

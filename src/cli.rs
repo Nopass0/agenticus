@@ -1,4 +1,4 @@
-use crate::agent::{Agent, InteractionLog, ReasoningStep};
+use crate::agent::{ExecutionPlan, InteractionLog, ReasoningStep, SubAgentResult, TaskStatus};
 use colored::*;
 use crossterm::{
     cursor, execute,
@@ -81,6 +81,124 @@ pub fn clear_thinking() {
     io::stdout().flush().unwrap();
 }
 
+/// Print the execution plan with checkboxes
+pub fn print_plan(plan: &ExecutionPlan) {
+    if plan.tasks.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "{}",
+        "┌─────────────────────────────────────────────────────────┐".bright_blue()
+    );
+    println!(
+        "{}  {} {}",
+        "│".bright_blue(),
+        "📋".bright_yellow(),
+        format!("План: {}", plan.goal).bright_white().bold()
+    );
+    println!(
+        "{}",
+        "├─────────────────────────────────────────────────────────┤".bright_blue()
+    );
+
+    for task in &plan.tasks {
+        let (checkbox, color) = match task.status {
+            TaskStatus::Completed => ("☑".to_string(), Color::Green),
+            TaskStatus::Failed => ("☒".to_string(), Color::Red),
+            TaskStatus::InProgress => ("◐".to_string(), Color::Yellow),
+            TaskStatus::Parallel => ("⇆".to_string(), Color::Cyan),
+            TaskStatus::Pending => ("☐".to_string(), Color::White),
+        };
+
+        let parallel_mark = if task.can_parallelize {
+            " ⚡".bright_cyan().to_string()
+        } else {
+            String::new()
+        };
+
+        println!(
+            "{}  {} {} {}{}",
+            "│".bright_blue(),
+            checkbox.color(color),
+            format!("{:2}.", task.id).dimmed(),
+            task.description.color(color),
+            parallel_mark
+        );
+
+        // Show truncated result if completed
+        if let Some(result) = &task.result {
+            let short_result = if result.len() > 60 {
+                let truncate_at = result
+                    .char_indices()
+                    .take_while(|(i, _)| *i < 60)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!("{}...", &result[..truncate_at])
+            } else {
+                result.clone()
+            };
+            println!(
+                "{}      {} {}",
+                "│".bright_blue(),
+                "→".dimmed(),
+                short_result.dimmed()
+            );
+        }
+    }
+
+    println!(
+        "{}",
+        "└─────────────────────────────────────────────────────────┘".bright_blue()
+    );
+}
+
+/// Print parallel execution results
+pub fn print_parallel_results(results: &[SubAgentResult]) {
+    if results.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "  {} {} {} tasks completed",
+        "⇆".bright_cyan(),
+        "Parallel:".bright_cyan().bold(),
+        results.len().to_string().bright_white()
+    );
+
+    for result in results {
+        let status_icon = if result.success {
+            "✓".bright_green()
+        } else {
+            "✗".bright_red()
+        };
+
+        println!(
+            "     {} Task {}: {}",
+            status_icon,
+            result.task_id.to_string().bright_white(),
+            result.task_description.dimmed()
+        );
+
+        // Show truncated result - safely handle UTF-8
+        let short_result = if result.result.len() > 100 {
+            let truncate_at = result.result
+                .char_indices()
+                .take_while(|(i, _)| *i < 100)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            format!("{}...", &result.result[..truncate_at])
+        } else {
+            result.result.clone()
+        };
+        println!("       {}", short_result.dimmed());
+    }
+}
+
 /// Print a reasoning step
 pub fn print_step(step: &ReasoningStep) {
     println!();
@@ -91,6 +209,16 @@ pub fn print_step(step: &ReasoningStep) {
         format!("Step {}:", step.step_number).bright_magenta().bold(),
         "─".repeat(50).dimmed()
     );
+
+    // Print plan if present
+    if let Some(plan) = &step.plan {
+        print_plan(plan);
+    }
+
+    // Print parallel results if any
+    if !step.parallel_results.is_empty() {
+        print_parallel_results(&step.parallel_results);
+    }
 
     // Thought (if any)
     if let Some(thought) = &step.thought {
@@ -128,9 +256,15 @@ pub fn print_step(step: &ReasoningStep) {
             "Result:".bright_green()
         );
 
-        // Truncate long results
+        // Truncate long results - safely handle UTF-8
         let display_result = if result.len() > 500 {
-            format!("{}...\n     [truncated]", &result[..500])
+            let truncate_at = result
+                .char_indices()
+                .take_while(|(i, _)| *i < 500)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            format!("{}...\n     [truncated]", &result[..truncate_at])
         } else {
             result.clone()
         };

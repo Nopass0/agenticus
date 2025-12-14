@@ -618,6 +618,340 @@ impl Tool for OpenWithDefaultTool {
     }
 }
 
+/// Tool to detect installed development technologies
+pub struct DetectTechnologiesTool;
+
+#[async_trait]
+impl Tool for DetectTechnologiesTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "detect_technologies",
+            "Detect installed development technologies (programming languages, runtimes, package managers)",
+        )
+    }
+
+    async fn execute(&self, _params: Value) -> Result<ToolResult> {
+        let mut technologies = Vec::new();
+
+        // List of commands to check and their names
+        let checks = vec![
+            // Languages
+            ("python3 --version", "python3", "Python 3"),
+            ("python --version", "python", "Python"),
+            ("node --version", "node", "Node.js"),
+            ("bun --version", "bun", "Bun"),
+            ("deno --version", "deno", "Deno"),
+            ("rustc --version", "rustc", "Rust"),
+            ("cargo --version", "cargo", "Cargo (Rust)"),
+            ("go version", "go", "Go"),
+            ("java --version", "java", "Java"),
+            ("dotnet --version", "dotnet", ".NET"),
+            ("ruby --version", "ruby", "Ruby"),
+            ("php --version", "php", "PHP"),
+            ("perl --version", "perl", "Perl"),
+            ("lua -v", "lua", "Lua"),
+            ("julia --version", "julia", "Julia"),
+            ("R --version", "R", "R"),
+            ("swift --version", "swift", "Swift"),
+            ("kotlin -version", "kotlin", "Kotlin"),
+            ("scala -version", "scala", "Scala"),
+            ("elixir --version", "elixir", "Elixir"),
+            ("erlang +V", "erlang", "Erlang"),
+            ("gcc --version", "gcc", "GCC (C/C++)"),
+            ("g++ --version", "g++", "G++ (C++)"),
+            ("clang --version", "clang", "Clang"),
+            // Package managers
+            ("npm --version", "npm", "NPM"),
+            ("yarn --version", "yarn", "Yarn"),
+            ("pnpm --version", "pnpm", "PNPM"),
+            ("pip --version", "pip", "Pip"),
+            ("pip3 --version", "pip3", "Pip3"),
+            ("pipenv --version", "pipenv", "Pipenv"),
+            ("poetry --version", "poetry", "Poetry"),
+            ("conda --version", "conda", "Conda"),
+            ("composer --version", "composer", "Composer (PHP)"),
+            ("gem --version", "gem", "RubyGems"),
+            ("bundle --version", "bundler", "Bundler (Ruby)"),
+            ("mvn --version", "maven", "Maven (Java)"),
+            ("gradle --version", "gradle", "Gradle (Java)"),
+            // Tools
+            ("git --version", "git", "Git"),
+            ("docker --version", "docker", "Docker"),
+            ("docker-compose --version", "docker-compose", "Docker Compose"),
+            ("kubectl version --client", "kubectl", "Kubernetes CLI"),
+            ("terraform --version", "terraform", "Terraform"),
+            ("ansible --version", "ansible", "Ansible"),
+            ("make --version", "make", "Make"),
+            ("cmake --version", "cmake", "CMake"),
+            ("vim --version", "vim", "Vim"),
+            ("nvim --version", "nvim", "Neovim"),
+            ("code --version", "vscode", "VS Code"),
+            ("cursor --version", "cursor", "Cursor"),
+        ];
+
+        for (cmd, name, display_name) in checks {
+            #[cfg(target_os = "windows")]
+            let output = Command::new("cmd")
+                .args(["/C", cmd])
+                .output();
+
+            #[cfg(not(target_os = "windows"))]
+            let output = Command::new("sh")
+                .args(["-c", cmd])
+                .output();
+
+            if let Ok(o) = output {
+                if o.status.success() {
+                    let version = String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    technologies.push(serde_json::json!({
+                        "name": name,
+                        "display_name": display_name,
+                        "version": version,
+                        "available": true
+                    }));
+                }
+            }
+        }
+
+        let output = if technologies.is_empty() {
+            "No development technologies detected.".to_string()
+        } else {
+            let mut s = String::from("Detected technologies:\n");
+            for tech in &technologies {
+                s.push_str(&format!(
+                    "  • {} - {}\n",
+                    tech["display_name"].as_str().unwrap_or(""),
+                    tech["version"].as_str().unwrap_or("")
+                ));
+            }
+            s
+        };
+
+        Ok(ToolResult::success_with_data(
+            output,
+            serde_json::json!({
+                "count": technologies.len(),
+                "technologies": technologies
+            }),
+        ))
+    }
+}
+
+/// Tool to create and run a script
+pub struct CreateAndRunScriptTool;
+
+#[async_trait]
+impl Tool for CreateAndRunScriptTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "create_and_run_script",
+            "Create a script file and run it. Supports Python, JavaScript/Node, Bash, Rust, and more.",
+        )
+        .with_param(ToolParameter::string("code", "The script code to execute", true))
+        .with_param(ToolParameter::string(
+            "language",
+            "Script language: python, javascript, typescript, bash, rust, go, ruby, php",
+            true,
+        ))
+        .with_param(ToolParameter::string(
+            "filename",
+            "Optional filename (default: auto-generated)",
+            false,
+        ))
+        .with_param(ToolParameter::boolean(
+            "keep_file",
+            "Keep the script file after execution (default: false)",
+            false,
+        ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let code = params
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Code is required"))?;
+
+        let language = params
+            .get("language")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Language is required"))?;
+
+        let keep_file = params
+            .get("keep_file")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Determine file extension and runner
+        let (extension, runner, runner_args): (&str, &str, Vec<&str>) = match language.to_lowercase().as_str() {
+            "python" | "py" => ("py", "python3", vec![]),
+            "javascript" | "js" | "node" => ("js", "node", vec![]),
+            "typescript" | "ts" => ("ts", "bun", vec!["run"]),
+            "bash" | "sh" => ("sh", "bash", vec![]),
+            "rust" | "rs" => ("rs", "rustc", vec!["--edition=2021", "-o", "/tmp/rust_script"]),
+            "go" => ("go", "go", vec!["run"]),
+            "ruby" | "rb" => ("rb", "ruby", vec![]),
+            "php" => ("php", "php", vec![]),
+            "lua" => ("lua", "lua", vec![]),
+            "perl" | "pl" => ("pl", "perl", vec![]),
+            _ => return Ok(ToolResult::error(format!("Unsupported language: {}", language))),
+        };
+
+        let filename = params
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("/tmp/agenticus_script_{}.{}", std::process::id(), extension));
+
+        // Write the script file
+        if let Err(e) = std::fs::write(&filename, code) {
+            return Ok(ToolResult::error(format!("Failed to write script: {}", e)));
+        }
+
+        // Make executable for shell scripts
+        #[cfg(unix)]
+        if extension == "sh" {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Run the script
+        let output = if language == "rust" {
+            // Rust needs compile then run
+            let compile = Command::new(runner)
+                .args(&runner_args)
+                .arg(&filename)
+                .output();
+
+            match compile {
+                Ok(o) if o.status.success() => {
+                    Command::new("/tmp/rust_script").output()
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    if !keep_file {
+                        let _ = std::fs::remove_file(&filename);
+                    }
+                    return Ok(ToolResult::error(format!("Compilation failed:\n{}", stderr)));
+                }
+                Err(e) => {
+                    if !keep_file {
+                        let _ = std::fs::remove_file(&filename);
+                    }
+                    return Ok(ToolResult::error(format!("Failed to compile: {}", e)));
+                }
+            }
+        } else {
+            let mut cmd = Command::new(runner);
+            for arg in &runner_args {
+                cmd.arg(arg);
+            }
+            cmd.arg(&filename).output()
+        };
+
+        // Clean up if not keeping file
+        if !keep_file {
+            let _ = std::fs::remove_file(&filename);
+            let _ = std::fs::remove_file("/tmp/rust_script");
+        }
+
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                let exit_code = o.status.code().unwrap_or(-1);
+
+                if o.status.success() {
+                    Ok(ToolResult::success_with_data(
+                        if stdout.is_empty() { "Script executed successfully (no output)".to_string() } else { stdout.clone() },
+                        serde_json::json!({
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": exit_code,
+                            "language": language,
+                            "success": true
+                        }),
+                    ))
+                } else {
+                    let error_output = if stderr.is_empty() { stdout } else { stderr };
+                    Ok(ToolResult::error(format!(
+                        "Script failed (exit code {}):\n{}",
+                        exit_code, error_output
+                    )))
+                }
+            }
+            Err(e) => Ok(ToolResult::error(format!("Failed to execute script: {}", e))),
+        }
+    }
+}
+
+/// Tool to evaluate a simple expression
+pub struct EvaluateExpressionTool;
+
+#[async_trait]
+impl Tool for EvaluateExpressionTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "evaluate",
+            "Evaluate a mathematical expression or simple Python/JavaScript expression",
+        )
+        .with_param(ToolParameter::string("expression", "The expression to evaluate", true))
+        .with_param(ToolParameter::string(
+            "language",
+            "Language to use: python, javascript (default: python)",
+            false,
+        ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let expression = params
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Expression is required"))?;
+
+        let language = params
+            .get("language")
+            .and_then(|v| v.as_str())
+            .unwrap_or("python");
+
+        let (runner, code) = match language {
+            "javascript" | "js" | "node" => {
+                ("node", format!("console.log(eval({:?}))", expression))
+            }
+            _ => {
+                ("python3", format!("print(eval({:?}))", expression))
+            }
+        };
+
+        let output = Command::new(runner)
+            .args(["-c", &code])
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                Ok(ToolResult::success_with_data(
+                    result.clone(),
+                    serde_json::json!({
+                        "expression": expression,
+                        "result": result,
+                        "language": language
+                    }),
+                ))
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                Ok(ToolResult::error(format!("Evaluation failed: {}", stderr)))
+            }
+            Err(e) => Ok(ToolResult::error(format!("Failed to evaluate: {}", e))),
+        }
+    }
+}
+
 pub fn register_utils_tools(registry: &mut crate::tools::ToolRegistry) {
     registry.add_tool(ClipboardCopyTool);
     registry.add_tool(ClipboardPasteTool);
@@ -628,4 +962,7 @@ pub fn register_utils_tools(registry: &mut crate::tools::ToolRegistry) {
     registry.add_tool(ListEnvTool);
     registry.add_tool(RunCommandTool);
     registry.add_tool(OpenWithDefaultTool);
+    registry.add_tool(DetectTechnologiesTool);
+    registry.add_tool(CreateAndRunScriptTool);
+    registry.add_tool(EvaluateExpressionTool);
 }

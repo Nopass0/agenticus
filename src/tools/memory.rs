@@ -427,10 +427,355 @@ pub fn create_shared_memory() -> SharedMemory {
     Arc::new(RwLock::new(store))
 }
 
+/// Tool to save a session summary to long-term memory
+pub struct SaveSessionSummaryTool {
+    memory: SharedMemory,
+}
+
+impl SaveSessionSummaryTool {
+    pub fn new(memory: SharedMemory) -> Self {
+        Self { memory }
+    }
+}
+
+#[async_trait]
+impl Tool for SaveSessionSummaryTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "save_session_summary",
+            "Save a summary of the current session/conversation to long-term memory. Use at the end of a session to remember key findings and context.",
+        )
+        .with_param(ToolParameter::string(
+            "summary",
+            "A concise summary of what was accomplished, key findings, or important context",
+            true,
+        ))
+        .with_param(ToolParameter::string(
+            "topic",
+            "The main topic or task name for this session",
+            true,
+        ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let summary = params
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Summary is required"))?
+            .to_string();
+
+        let topic = params
+            .get("topic")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Topic is required"))?
+            .to_string();
+
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let key = format!("session_{}", timestamp);
+
+        let full_summary = format!("Topic: {}\n\n{}", topic, summary);
+
+        {
+            let mut store = self.memory.write().unwrap();
+            store.set(key.clone(), full_summary.clone(), Some("sessions".to_string()));
+            store.save(&memory_path())?;
+        }
+
+        Ok(ToolResult::success_with_data(
+            format!("Session summary saved with key '{}'", key),
+            serde_json::json!({
+                "key": key,
+                "topic": topic,
+                "summary": summary
+            }),
+        ))
+    }
+}
+
+/// Tool to get recent session summaries
+pub struct GetRecentSessionsTool {
+    memory: SharedMemory,
+}
+
+impl GetRecentSessionsTool {
+    pub fn new(memory: SharedMemory) -> Self {
+        Self { memory }
+    }
+}
+
+#[async_trait]
+impl Tool for GetRecentSessionsTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "get_recent_sessions",
+            "Get summaries of recent sessions to understand past context and work",
+        )
+        .with_param(ToolParameter::number(
+            "limit",
+            "Number of recent sessions to retrieve (default: 5)",
+            false,
+        ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
+
+        let store = self.memory.read().unwrap();
+        let mut sessions: Vec<_> = store
+            .list_by_category("sessions")
+            .into_iter()
+            .collect();
+
+        // Sort by key (which contains timestamp) descending
+        sessions.sort_by(|a, b| b.key.cmp(&a.key));
+        sessions.truncate(limit);
+
+        if sessions.is_empty() {
+            Ok(ToolResult::success("No session summaries found"))
+        } else {
+            let mut output = format!("Recent {} session summaries:\n\n", sessions.len());
+            let mut json_results = Vec::new();
+
+            for entry in &sessions {
+                output.push_str(&format!("=== {} ===\n{}\n\n", entry.key, entry.value));
+                json_results.push(serde_json::json!({
+                    "key": entry.key,
+                    "summary": entry.value,
+                    "created_at": entry.created_at.to_rfc3339()
+                }));
+            }
+
+            Ok(ToolResult::success_with_data(
+                output,
+                serde_json::json!({ "sessions": json_results }),
+            ))
+        }
+    }
+}
+
+/// Tool to save a custom tool to memory
+pub struct SaveCustomToolTool {
+    memory: SharedMemory,
+}
+
+impl SaveCustomToolTool {
+    pub fn new(memory: SharedMemory) -> Self {
+        Self { memory }
+    }
+}
+
+#[async_trait]
+impl Tool for SaveCustomToolTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "save_custom_tool",
+            "Save a custom tool/script to memory for reuse. The tool will be available in future sessions.",
+        )
+        .with_param(ToolParameter::string("name", "Unique name for the tool", true))
+        .with_param(ToolParameter::string("description", "What the tool does", true))
+        .with_param(ToolParameter::string("language", "Programming language: python, javascript, bash, rust, etc.", true))
+        .with_param(ToolParameter::string("code", "The tool's source code", true))
+        .with_param(ToolParameter::string("usage", "Example usage or parameters", false))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Name required"))?;
+        let description = params.get("description").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Description required"))?;
+        let language = params.get("language").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Language required"))?;
+        let code = params.get("code").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Code required"))?;
+        let usage = params.get("usage").and_then(|v| v.as_str()).unwrap_or("");
+
+        let tool_data = serde_json::json!({
+            "name": name,
+            "description": description,
+            "language": language,
+            "code": code,
+            "usage": usage,
+            "created_at": Utc::now().to_rfc3339()
+        });
+
+        let key = format!("tool_{}", name);
+        let value = serde_json::to_string_pretty(&tool_data)?;
+
+        {
+            let mut store = self.memory.write().unwrap();
+            store.set(key.clone(), value, Some("custom_tools".to_string()));
+            store.save(&memory_path())?;
+        }
+
+        Ok(ToolResult::success_with_data(
+            format!("Custom tool '{}' saved. Use 'run_custom_tool' to execute it.", name),
+            tool_data,
+        ))
+    }
+}
+
+/// Tool to list available custom tools
+pub struct ListCustomToolsTool {
+    memory: SharedMemory,
+}
+
+impl ListCustomToolsTool {
+    pub fn new(memory: SharedMemory) -> Self {
+        Self { memory }
+    }
+}
+
+#[async_trait]
+impl Tool for ListCustomToolsTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "list_custom_tools",
+            "List all custom tools saved to memory",
+        )
+    }
+
+    async fn execute(&self, _params: Value) -> Result<ToolResult> {
+        let store = self.memory.read().unwrap();
+        let tools: Vec<_> = store.list_by_category("custom_tools");
+
+        if tools.is_empty() {
+            Ok(ToolResult::success("No custom tools found. Use 'save_custom_tool' to create one."))
+        } else {
+            let mut output = format!("Available custom tools ({}):\n\n", tools.len());
+            let mut json_results = Vec::new();
+
+            for entry in &tools {
+                if let Ok(tool_data) = serde_json::from_str::<serde_json::Value>(&entry.value) {
+                    let name = tool_data["name"].as_str().unwrap_or(&entry.key);
+                    let desc = tool_data["description"].as_str().unwrap_or("");
+                    let lang = tool_data["language"].as_str().unwrap_or("");
+                    output.push_str(&format!("• {} [{}]: {}\n", name, lang, desc));
+                    json_results.push(tool_data);
+                }
+            }
+
+            Ok(ToolResult::success_with_data(
+                output,
+                serde_json::json!({ "tools": json_results }),
+            ))
+        }
+    }
+}
+
+/// Tool to run a custom tool
+pub struct RunCustomToolTool {
+    memory: SharedMemory,
+}
+
+impl RunCustomToolTool {
+    pub fn new(memory: SharedMemory) -> Self {
+        Self { memory }
+    }
+}
+
+#[async_trait]
+impl Tool for RunCustomToolTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "run_custom_tool",
+            "Run a custom tool that was previously saved to memory",
+        )
+        .with_param(ToolParameter::string("name", "Name of the custom tool to run", true))
+        .with_param(ToolParameter::string("args", "Arguments to pass to the tool (as JSON or space-separated)", false))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Name required"))?;
+        let args = params.get("args").and_then(|v| v.as_str()).unwrap_or("");
+
+        let key = format!("tool_{}", name);
+
+        let tool_data = {
+            let store = self.memory.read().unwrap();
+            store.entries.get(&key).map(|e| e.value.clone())
+        };
+
+        let tool_json: serde_json::Value = match tool_data {
+            Some(data) => serde_json::from_str(&data)?,
+            None => return Ok(ToolResult::error(format!("Custom tool '{}' not found", name))),
+        };
+
+        let language = tool_json["language"].as_str().unwrap_or("python");
+        let code = tool_json["code"].as_str().ok_or_else(|| anyhow::anyhow!("Tool has no code"))?;
+
+        // Determine file extension and runner
+        let (extension, runner, runner_args): (&str, &str, Vec<&str>) = match language.to_lowercase().as_str() {
+            "python" | "py" => ("py", "python3", vec![]),
+            "javascript" | "js" | "node" => ("js", "node", vec![]),
+            "bash" | "sh" => ("sh", "bash", vec![]),
+            "ruby" | "rb" => ("rb", "ruby", vec![]),
+            _ => ("py", "python3", vec![]),
+        };
+
+        let filename = format!("/tmp/custom_tool_{}.{}", std::process::id(), extension);
+
+        // Write the script file
+        std::fs::write(&filename, code)?;
+
+        // Make executable for shell scripts
+        #[cfg(unix)]
+        if extension == "sh" {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Run the script
+        let mut cmd = std::process::Command::new(runner);
+        for arg in &runner_args {
+            cmd.arg(arg);
+        }
+        cmd.arg(&filename);
+
+        // Add arguments
+        if !args.is_empty() {
+            for arg in args.split_whitespace() {
+                cmd.arg(arg);
+            }
+        }
+
+        let output = cmd.output();
+
+        // Clean up
+        let _ = std::fs::remove_file(&filename);
+
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+
+                if o.status.success() {
+                    Ok(ToolResult::success_with_data(
+                        if stdout.is_empty() { "Tool executed successfully".to_string() } else { stdout.clone() },
+                        serde_json::json!({
+                            "tool": name,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "success": true
+                        }),
+                    ))
+                } else {
+                    let error_output = if stderr.is_empty() { stdout } else { stderr };
+                    Ok(ToolResult::error(format!("Tool '{}' failed:\n{}", name, error_output)))
+                }
+            }
+            Err(e) => Ok(ToolResult::error(format!("Failed to run tool: {}", e))),
+        }
+    }
+}
+
 pub fn register_memory_tools(registry: &mut crate::tools::ToolRegistry, memory: SharedMemory) {
     registry.add_tool(MemorySaveTool::new(memory.clone()));
     registry.add_tool(MemoryGetTool::new(memory.clone()));
     registry.add_tool(MemorySearchTool::new(memory.clone()));
     registry.add_tool(MemoryListTool::new(memory.clone()));
-    registry.add_tool(MemoryDeleteTool::new(memory));
+    registry.add_tool(MemoryDeleteTool::new(memory.clone()));
+    registry.add_tool(SaveSessionSummaryTool::new(memory.clone()));
+    registry.add_tool(GetRecentSessionsTool::new(memory.clone()));
+    registry.add_tool(SaveCustomToolTool::new(memory.clone()));
+    registry.add_tool(ListCustomToolsTool::new(memory.clone()));
+    registry.add_tool(RunCustomToolTool::new(memory));
 }

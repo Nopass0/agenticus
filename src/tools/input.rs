@@ -510,9 +510,544 @@ if ($windows) {{
     }
 }
 
+/// Tool to move mouse to a position
+pub struct MouseMoveTool;
+
+#[async_trait]
+impl Tool for MouseMoveTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new("mouse_move", "Move the mouse cursor to specified coordinates")
+            .with_param(ToolParameter::number("x", "X coordinate", true))
+            .with_param(ToolParameter::number("y", "Y coordinate", true))
+            .with_param(ToolParameter::number(
+                "duration_ms",
+                "Duration of movement in milliseconds (0 for instant, default: 0)",
+                false,
+            ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let x = params
+            .get("x")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("X coordinate is required"))?;
+        let y = params
+            .get("y")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("Y coordinate is required"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let output = Command::new("xdotool")
+                .args(["mousemove", &x.to_string(), &y.to_string()])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    Ok(ToolResult::success(format!("Mouse moved to ({}, {})", x, y)))
+                }
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                "[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})",
+                x, y
+            );
+            let output = Command::new("powershell")
+                .args(["-Command", &format!("Add-Type -AssemblyName System.Windows.Forms; {}", script)])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    Ok(ToolResult::success(format!("Mouse moved to ({}, {})", x, y)))
+                }
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Ok(ToolResult::error("Mouse move not supported on this platform"))
+        }
+    }
+}
+
+/// Tool to drag the mouse (click, move, release)
+pub struct MouseDragTool;
+
+#[async_trait]
+impl Tool for MouseDragTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "mouse_drag",
+            "Drag the mouse from one position to another (click and hold, move, release)",
+        )
+        .with_param(ToolParameter::number("start_x", "Starting X coordinate", true))
+        .with_param(ToolParameter::number("start_y", "Starting Y coordinate", true))
+        .with_param(ToolParameter::number("end_x", "Ending X coordinate", true))
+        .with_param(ToolParameter::number("end_y", "Ending Y coordinate", true))
+        .with_param(ToolParameter::string(
+            "button",
+            "Mouse button: left, right, middle (default: left)",
+            false,
+        ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let start_x = params.get("start_x").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("start_x required"))?;
+        let start_y = params.get("start_y").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("start_y required"))?;
+        let end_x = params.get("end_x").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("end_x required"))?;
+        let end_y = params.get("end_y").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("end_y required"))?;
+        let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+
+        #[cfg(target_os = "linux")]
+        {
+            let button_num = match button {
+                "left" => "1",
+                "right" => "3",
+                "middle" => "2",
+                _ => "1",
+            };
+
+            // Move to start, press button, move to end, release button
+            let commands = vec![
+                format!("mousemove {} {}", start_x, start_y),
+                format!("mousedown {}", button_num),
+                format!("mousemove {} {}", end_x, end_y),
+                format!("mouseup {}", button_num),
+            ];
+
+            for cmd in commands {
+                let output = Command::new("xdotool")
+                    .args(cmd.split_whitespace())
+                    .output();
+
+                if let Ok(o) = output {
+                    if !o.status.success() {
+                        return Ok(ToolResult::error(format!(
+                            "Drag failed: {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        )));
+                    }
+                }
+                // Small delay between commands
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            Ok(ToolResult::success(format!(
+                "Dragged from ({}, {}) to ({}, {})",
+                start_x, start_y, end_x, end_y
+            )))
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                r#"
+Add-Type -AssemblyName System.Windows.Forms
+$sig = '[DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);'
+$mouse = Add-Type -MemberDefinition $sig -Name "MouseEvent" -Namespace "Win32" -PassThru
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})
+Start-Sleep -Milliseconds 50
+$mouse::mouse_event(0x0002, 0, 0, 0, 0)
+Start-Sleep -Milliseconds 50
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})
+Start-Sleep -Milliseconds 50
+$mouse::mouse_event(0x0004, 0, 0, 0, 0)
+"#,
+                start_x, start_y, end_x, end_y
+            );
+
+            let output = Command::new("powershell")
+                .args(["-Command", &script])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => Ok(ToolResult::success(format!(
+                    "Dragged from ({}, {}) to ({}, {})",
+                    start_x, start_y, end_x, end_y
+                ))),
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Ok(ToolResult::error("Mouse drag not supported on this platform"))
+        }
+    }
+}
+
+/// Tool to scroll the mouse wheel
+pub struct MouseScrollTool;
+
+#[async_trait]
+impl Tool for MouseScrollTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new("mouse_scroll", "Scroll the mouse wheel up or down")
+            .with_param(ToolParameter::number(
+                "amount",
+                "Number of scroll units (positive = up, negative = down)",
+                true,
+            ))
+            .with_param(ToolParameter::number("x", "X coordinate to scroll at (optional)", false))
+            .with_param(ToolParameter::number("y", "Y coordinate to scroll at (optional)", false))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let amount = params
+            .get("amount")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("Amount is required"))?;
+
+        let x = params.get("x").and_then(|v| v.as_i64());
+        let y = params.get("y").and_then(|v| v.as_i64());
+
+        #[cfg(target_os = "linux")]
+        {
+            // Move to position if specified
+            if let (Some(x_val), Some(y_val)) = (x, y) {
+                let _ = Command::new("xdotool")
+                    .args(["mousemove", &x_val.to_string(), &y_val.to_string()])
+                    .output();
+            }
+
+            // xdotool uses button 4 for scroll up, 5 for scroll down
+            let (button, times) = if amount > 0 {
+                ("4", amount as usize)
+            } else {
+                ("5", (-amount) as usize)
+            };
+
+            for _ in 0..times {
+                let _ = Command::new("xdotool")
+                    .args(["click", button])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            let direction = if amount > 0 { "up" } else { "down" };
+            Ok(ToolResult::success(format!(
+                "Scrolled {} {} times",
+                direction,
+                times
+            )))
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut script = String::from("Add-Type -AssemblyName System.Windows.Forms; ");
+
+            if let (Some(x_val), Some(y_val)) = (x, y) {
+                script.push_str(&format!(
+                    "[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {}); ",
+                    x_val, y_val
+                ));
+            }
+
+            // WHEEL_DELTA is 120, negative for down, positive for up
+            let wheel_delta = amount * 120;
+            script.push_str(&format!(
+                r#"$sig = '[DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);'
+$mouse = Add-Type -MemberDefinition $sig -Name "MouseEvent" -Namespace "Win32" -PassThru
+$mouse::mouse_event(0x0800, 0, 0, {}, 0)"#,
+                wheel_delta
+            ));
+
+            let output = Command::new("powershell")
+                .args(["-Command", &script])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    let direction = if amount > 0 { "up" } else { "down" };
+                    Ok(ToolResult::success(format!("Scrolled {}", direction)))
+                }
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Ok(ToolResult::error("Mouse scroll not supported on this platform"))
+        }
+    }
+}
+
+/// Tool to hold down or release a mouse button
+pub struct MouseHoldTool;
+
+#[async_trait]
+impl Tool for MouseHoldTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new("mouse_hold", "Press and hold or release a mouse button")
+            .with_param(ToolParameter::string(
+                "action",
+                "Action to perform: 'down' (press and hold) or 'up' (release)",
+                true,
+            ))
+            .with_param(ToolParameter::string(
+                "button",
+                "Mouse button: left, right, middle (default: left)",
+                false,
+            ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Action is required"))?;
+
+        let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+
+        #[cfg(target_os = "linux")]
+        {
+            let button_num = match button {
+                "left" => "1",
+                "right" => "3",
+                "middle" => "2",
+                _ => "1",
+            };
+
+            let xdotool_action = match action {
+                "down" => "mousedown",
+                "up" => "mouseup",
+                _ => return Ok(ToolResult::error("Invalid action. Use 'down' or 'up'")),
+            };
+
+            let output = Command::new("xdotool")
+                .args([xdotool_action, button_num])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => Ok(ToolResult::success(format!(
+                    "Mouse {} button {}",
+                    button,
+                    if action == "down" { "pressed" } else { "released" }
+                ))),
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let (down_flag, up_flag) = match button {
+                "left" => ("0x0002", "0x0004"),
+                "right" => ("0x0008", "0x0010"),
+                "middle" => ("0x0020", "0x0040"),
+                _ => ("0x0002", "0x0004"),
+            };
+
+            let flag = match action {
+                "down" => down_flag,
+                "up" => up_flag,
+                _ => return Ok(ToolResult::error("Invalid action. Use 'down' or 'up'")),
+            };
+
+            let script = format!(
+                r#"$sig = '[DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);'
+$mouse = Add-Type -MemberDefinition $sig -Name "MouseEvent" -Namespace "Win32" -PassThru
+$mouse::mouse_event({}, 0, 0, 0, 0)"#,
+                flag
+            );
+
+            let output = Command::new("powershell")
+                .args(["-Command", &script])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => Ok(ToolResult::success(format!(
+                    "Mouse {} button {}",
+                    button,
+                    if action == "down" { "pressed" } else { "released" }
+                ))),
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Ok(ToolResult::error("Mouse hold not supported on this platform"))
+        }
+    }
+}
+
+/// Tool to get current mouse position
+pub struct MousePositionTool;
+
+#[async_trait]
+impl Tool for MousePositionTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new("mouse_position", "Get the current mouse cursor position")
+    }
+
+    async fn execute(&self, _params: Value) -> Result<ToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            let output = Command::new("xdotool").args(["getmouselocation"]).output();
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    let result = String::from_utf8_lossy(&o.stdout);
+                    // Parse "x:123 y:456 screen:0 window:123456"
+                    let x: Option<i32> = result
+                        .split_whitespace()
+                        .find(|s| s.starts_with("x:"))
+                        .and_then(|s| s[2..].parse().ok());
+                    let y: Option<i32> = result
+                        .split_whitespace()
+                        .find(|s| s.starts_with("y:"))
+                        .and_then(|s| s[2..].parse().ok());
+
+                    if let (Some(x), Some(y)) = (x, y) {
+                        Ok(ToolResult::success_with_data(
+                            format!("Mouse position: ({}, {})", x, y),
+                            serde_json::json!({"x": x, "y": y}),
+                        ))
+                    } else {
+                        Ok(ToolResult::error("Failed to parse mouse position"))
+                    }
+                }
+                _ => Ok(ToolResult::error("Failed to get mouse position")),
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$pos = [System.Windows.Forms.Cursor]::Position
+"$($pos.X),$($pos.Y)"
+"#;
+            let output = Command::new("powershell")
+                .args(["-Command", script])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let parts: Vec<&str> = result.split(',').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(x), Ok(y)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                            return Ok(ToolResult::success_with_data(
+                                format!("Mouse position: ({}, {})", x, y),
+                                serde_json::json!({"x": x, "y": y}),
+                            ));
+                        }
+                    }
+                    Ok(ToolResult::error("Failed to parse mouse position"))
+                }
+                _ => Ok(ToolResult::error("Failed to get mouse position")),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Ok(ToolResult::error("Mouse position not supported on this platform"))
+        }
+    }
+}
+
+/// Tool to hold a key
+pub struct KeyHoldTool;
+
+#[async_trait]
+impl Tool for KeyHoldTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new("key_hold", "Press and hold or release a key")
+            .with_param(ToolParameter::string(
+                "key",
+                "Key to hold: shift, ctrl, alt, super, or any key name",
+                true,
+            ))
+            .with_param(ToolParameter::string(
+                "action",
+                "Action: 'down' (press and hold) or 'up' (release)",
+                true,
+            ))
+    }
+
+    async fn execute(&self, params: Value) -> Result<ToolResult> {
+        let key = params
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Key is required"))?;
+
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Action is required"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let xdotool_action = match action {
+                "down" => "keydown",
+                "up" => "keyup",
+                _ => return Ok(ToolResult::error("Invalid action. Use 'down' or 'up'")),
+            };
+
+            let output = Command::new("xdotool")
+                .args([xdotool_action, key])
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => Ok(ToolResult::success(format!(
+                    "Key '{}' {}",
+                    key,
+                    if action == "down" { "pressed" } else { "released" }
+                ))),
+                Ok(o) => Ok(ToolResult::error(format!(
+                    "Failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ))),
+                Err(e) => Ok(ToolResult::error(format!("Failed: {}", e))),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(ToolResult::error("Key hold not fully supported on this platform"))
+        }
+    }
+}
+
 pub fn register_input_tools(registry: &mut crate::tools::ToolRegistry) {
     registry.add_tool(TypeTextTool);
     registry.add_tool(PressKeyTool);
     registry.add_tool(MouseClickTool);
+    registry.add_tool(MouseMoveTool);
+    registry.add_tool(MouseDragTool);
+    registry.add_tool(MouseScrollTool);
+    registry.add_tool(MouseHoldTool);
+    registry.add_tool(MousePositionTool);
+    registry.add_tool(KeyHoldTool);
     registry.add_tool(FocusWindowTool);
 }

@@ -125,14 +125,19 @@ pub struct WebSearchTool;
 impl WebSearchTool {
     async fn search_duckduckgo(client: &reqwest::Client, query: &str, max_results: usize) -> Result<Vec<serde_json::Value>> {
         let encoded_query = urlencoding::encode(query);
-        let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+        // Use lite version which is more scraper-friendly
+        let search_url = format!("https://lite.duckduckgo.com/lite/?q={}", encoded_query);
 
-        debug!("DuckDuckGo search URL: {}", search_url);
+        debug!("DuckDuckGo Lite search URL: {}", search_url);
 
         let response = client
             .get(&search_url)
-            .header("Accept", "text/html,application/xhtml+xml")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+            .header("Accept-Encoding", "gzip, deflate")
+            .header("DNT", "1")
+            .header("Connection", "keep-alive")
+            .header("Upgrade-Insecure-Requests", "1")
             .send()
             .await?;
 
@@ -148,79 +153,62 @@ impl WebSearchTool {
 
         let document = Html::parse_document(&html);
 
-        // Try multiple selectors as DuckDuckGo structure may vary
-        let result_selectors = vec![
-            ".result",
-            ".web-result",
-            ".results_links",
-            "div[data-result]",
-        ];
-
+        // DDG Lite uses table-based layout with specific structure
         let mut results = Vec::new();
 
-        for selector_str in result_selectors {
-            if let Ok(result_selector) = Selector::parse(selector_str) {
-                let title_selectors = vec![
-                    ".result__title a",
-                    ".result__a",
-                    "a.result__url",
-                    "h2 a",
-                    ".title a",
-                ];
-                let snippet_selectors = vec![
-                    ".result__snippet",
-                    ".result__body",
-                    ".snippet",
-                    ".description",
-                ];
+        // In DDG Lite, results are in table rows with class "result-link" for links
+        // and following rows for snippets
+        if let Ok(link_selector) = Selector::parse("a.result-link") {
+            for link_elem in document.select(&link_selector).take(max_results) {
+                let title = link_elem.text().collect::<Vec<_>>().join("").trim().to_string();
+                let url = link_elem.value().attr("href").unwrap_or("").to_string();
 
-                for result in document.select(&result_selector).take(max_results) {
-                    let mut title = String::new();
-                    let mut url = String::new();
+                if !title.is_empty() && !url.is_empty() {
+                    // Extract actual URL from DDG redirect
+                    let actual_url = if url.contains("uddg=") {
+                        url.split("uddg=").nth(1)
+                            .and_then(|u| urlencoding::decode(u))
+                            .unwrap_or(url.clone())
+                    } else {
+                        url.clone()
+                    };
 
-                    // Try to find title
-                    for ts in &title_selectors {
-                        if let Ok(sel) = Selector::parse(ts) {
-                            if let Some(elem) = result.select(&sel).next() {
-                                title = elem.text().collect::<Vec<_>>().join("").trim().to_string();
-                                // Try to get href
-                                if let Some(href) = elem.value().attr("href") {
-                                    url = href.to_string();
-                                }
-                                if !title.is_empty() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    results.push(serde_json::json!({
+                        "title": title,
+                        "snippet": "",
+                        "url": actual_url
+                    }));
+                }
+            }
+        }
 
-                    // Try to find snippet
-                    let mut snippet = String::new();
-                    for ss in &snippet_selectors {
-                        if let Ok(sel) = Selector::parse(ss) {
-                            if let Some(elem) = result.select(&sel).next() {
-                                snippet = elem.text().collect::<Vec<_>>().join("").trim().to_string();
-                                if !snippet.is_empty() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+        // If no results from lite selector, try standard HTML selectors
+        if results.is_empty() {
+            let result_selectors = vec![".result", ".web-result", ".results_links", "tr"];
 
-                    // Try to extract URL from href if not found
-                    if url.is_empty() {
-                        if let Ok(url_sel) = Selector::parse(".result__url, .url, a[href]") {
-                            if let Some(elem) = result.select(&url_sel).next() {
-                                url = elem.text().collect::<Vec<_>>().join("").trim().to_string();
-                                if url.is_empty() {
-                                    if let Some(href) = elem.value().attr("href") {
-                                        // DuckDuckGo wraps URLs in redirect
-                                        if href.contains("uddg=") {
-                                            if let Some(real_url) = href.split("uddg=").nth(1) {
-                                                url = urlencoding::decode(real_url).unwrap_or_default();
-                                            }
+            for selector_str in result_selectors {
+                if let Ok(result_selector) = Selector::parse(selector_str) {
+                    for result in document.select(&result_selector).take(max_results * 2) {
+                        if let Ok(link_sel) = Selector::parse("a") {
+                            if let Some(link) = result.select(&link_sel).next() {
+                                let title = link.text().collect::<Vec<_>>().join("").trim().to_string();
+                                if let Some(href) = link.value().attr("href") {
+                                    if !title.is_empty() && (href.starts_with("http") || href.contains("uddg=")) {
+                                        let url = if href.contains("uddg=") {
+                                            href.split("uddg=").nth(1)
+                                                .and_then(|u| urlencoding::decode(u))
+                                                .unwrap_or_else(|| href.to_string())
                                         } else {
-                                            url = href.to_string();
+                                            href.to_string()
+                                        };
+
+                                        // Avoid duplicate titles
+                                        if !results.iter().any(|r| r.get("title").and_then(|t| t.as_str()) == Some(&title)) {
+                                            results.push(serde_json::json!({
+                                                "title": title,
+                                                "snippet": "",
+                                                "url": url
+                                            }));
                                         }
                                     }
                                 }
@@ -228,17 +216,71 @@ impl WebSearchTool {
                         }
                     }
 
-                    if !title.is_empty() {
-                        results.push(serde_json::json!({
-                            "title": title,
-                            "snippet": snippet,
-                            "url": url
-                        }));
+                    if results.len() >= max_results {
+                        break;
+                    }
+                }
+            }
+        }
+
+        results.truncate(max_results);
+        Ok(results)
+    }
+
+    async fn search_bing(client: &reqwest::Client, query: &str, max_results: usize) -> Result<Vec<serde_json::Value>> {
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!("https://www.bing.com/search?q={}&count={}", encoded_query, max_results);
+
+        debug!("Bing search URL: {}", search_url);
+
+        let response = client
+            .get(&search_url)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("Bing returned status: {}", response.status()));
+        }
+
+        let html = response.text().await?;
+        let document = Html::parse_document(&html);
+
+        debug!("Bing HTML length: {}", html.len());
+
+        let mut results = Vec::new();
+
+        // Bing results are in li.b_algo elements
+        if let Ok(result_selector) = Selector::parse("li.b_algo") {
+            for result in document.select(&result_selector).take(max_results) {
+                let mut title = String::new();
+                let mut url = String::new();
+                let mut snippet = String::new();
+
+                // Title is in h2 > a
+                if let Ok(title_sel) = Selector::parse("h2 a") {
+                    if let Some(elem) = result.select(&title_sel).next() {
+                        title = elem.text().collect::<Vec<_>>().join("").trim().to_string();
+                        if let Some(href) = elem.value().attr("href") {
+                            url = href.to_string();
+                        }
                     }
                 }
 
-                if !results.is_empty() {
-                    break;
+                // Snippet is in .b_caption p
+                if let Ok(snippet_sel) = Selector::parse(".b_caption p, p") {
+                    if let Some(elem) = result.select(&snippet_sel).next() {
+                        snippet = elem.text().collect::<Vec<_>>().join("").trim().to_string();
+                    }
+                }
+
+                if !title.is_empty() && url.starts_with("http") {
+                    results.push(serde_json::json!({
+                        "title": title,
+                        "snippet": snippet,
+                        "url": url
+                    }));
                 }
             }
         }
@@ -342,19 +384,39 @@ impl Tool for WebSearchTool {
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()?;
 
-        // Try DuckDuckGo first
+        // Try DuckDuckGo Lite first (most reliable for scraping)
         let mut results = match Self::search_duckduckgo(&client, query, max_results).await {
-            Ok(r) => r,
+            Ok(r) => {
+                debug!("DuckDuckGo returned {} results", r.len());
+                r
+            }
             Err(e) => {
                 warn!("DuckDuckGo search failed: {}", e);
                 Vec::new()
             }
         };
 
-        // If no results, try Google
+        // If no results, try Bing
+        if results.is_empty() {
+            results = match Self::search_bing(&client, query, max_results).await {
+                Ok(r) => {
+                    debug!("Bing returned {} results", r.len());
+                    r
+                }
+                Err(e) => {
+                    warn!("Bing search failed: {}", e);
+                    Vec::new()
+                }
+            };
+        }
+
+        // If still no results, try Google
         if results.is_empty() {
             results = match Self::search_google_scrape(&client, query, max_results).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    debug!("Google returned {} results", r.len());
+                    r
+                }
                 Err(e) => {
                     warn!("Google search failed: {}", e);
                     Vec::new()

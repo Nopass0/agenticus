@@ -4,6 +4,7 @@ mod coding_agent;
 mod config;
 mod llm;
 mod logging;
+mod security_agent;
 mod task_queue;
 mod tools;
 
@@ -33,8 +34,14 @@ fn create_tool_registry() -> ToolRegistry {
     tools::file_ops::register_file_tools(&mut registry);
     tools::utils::register_utils_tools(&mut registry);
 
+    // Register security analysis tools
+    tools::security::register_security_tools(&mut registry);
+
     // Register coding sub-agent tools
     coding_agent::tool::register_coding_tools(&mut registry);
+
+    // Register security sub-agent tools
+    security_agent::tool::register_security_agent_tools(&mut registry);
 
     // Register memory tools with shared memory
     let memory = create_shared_memory();

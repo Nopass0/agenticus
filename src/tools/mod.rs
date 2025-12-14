@@ -9,5 +9,6 @@ pub mod processes;
 pub mod input;
 pub mod file_ops;
 pub mod utils;
+pub mod security;
 
 pub use registry::{Tool, ToolRegistry, ToolResult, ToolSchema, ToolParameter};

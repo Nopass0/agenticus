@@ -7,5 +7,7 @@ pub mod memory;
 pub mod screenshot;
 pub mod processes;
 pub mod input;
+pub mod file_ops;
+pub mod utils;
 
 pub use registry::{Tool, ToolRegistry, ToolResult, ToolSchema, ToolParameter};

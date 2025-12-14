@@ -93,9 +93,16 @@ impl Tool for WebFetchTool {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Truncate if needed
+        // Truncate if needed (safely handle UTF-8 boundaries)
         let text = if text.len() > max_length {
-            format!("{}... [truncated]", &text[..max_length])
+            // Find the last valid character boundary at or before max_length
+            let truncate_at = text
+                .char_indices()
+                .take_while(|(i, _)| *i < max_length)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            format!("{}... [truncated]", &text[..truncate_at])
         } else {
             text
         };

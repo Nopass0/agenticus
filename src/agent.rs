@@ -410,15 +410,28 @@ impl Agent {
 
 4. **MODIFY PLAN**: If needed - add new tasks via modify_plan
 
-5. **WEB SEQUENCE**:
-   - web_search -> find links
-   - web_fetch -> load content (REQUIRED!)
-   - write_file -> save file
-   - open_with_default -> open
+5. **WEB SEQUENCE** (ОБЯЗАТЕЛЬНО!):
+   - web_search -> найти URL
+   - web_fetch -> загрузить контент с КОНКРЕТНОГО URL из результатов поиска
+   - ПРОВЕРЬ что контент НЕ пустой!
+   - write_file -> сохранить РЕАЛЬНЫЕ данные (НЕ placeholder!)
+   - open_with_default -> открыть
 
 6. **PARALLELISM**: Use parallel_execute for multiple web_fetch
 
-REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
+7. **НИКОГДА НЕ ПИШИ PLACEHOLDER!**
+   - НЕ пиши "информация будет позже"
+   - НЕ пиши "данные будут добавлены"
+   - НЕ пиши "TODO" или "..."
+   - Пиши ТОЛЬКО реальные данные из результатов!
+   - Если данных нет - сначала получи их!
+
+8. **ПРОВЕРКА РЕЗУЛЬТАТОВ**:
+   - Если web_fetch вернул пустой результат - попробуй другой URL
+   - Если нет данных - модифицируй план и добавь шаги для получения данных
+   - НЕ считай задачу выполненной без реального результата!
+
+REMEMBER: Output ONLY valid JSON! Complete ALL tasks with REAL data!
 "#);
 
         prompt
@@ -573,6 +586,59 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
         results
     }
 
+    /// Check if a tool result is meaningful (not empty, not placeholder, not error-like)
+    fn is_meaningful_result(result: &str, tool_name: &str) -> bool {
+        let trimmed = result.trim();
+
+        // Empty or very short results are not meaningful
+        if trimmed.is_empty() || trimmed.len() < 5 {
+            return false;
+        }
+
+        // Placeholder patterns to detect
+        let placeholder_patterns = [
+            "будет заполн",
+            "будет добавл",
+            "placeholder",
+            "TODO",
+            "FIXME",
+            "позже",
+            "later",
+            "информация будет",
+            "данные будут",
+            "to be filled",
+            "to be added",
+            "...",
+            "TBD",
+        ];
+
+        let lower = trimmed.to_lowercase();
+        for pattern in &placeholder_patterns {
+            if lower.contains(&pattern.to_lowercase()) {
+                return false;
+            }
+        }
+
+        // For web_fetch, check if we got actual content
+        if tool_name == "web_fetch" {
+            // If result is too short for a web page, it's probably empty
+            if trimmed.len() < 50 {
+                return false;
+            }
+        }
+
+        // For write_file, check content length in the args (not result)
+        // Result should indicate success
+        if tool_name == "write_file" {
+            // Check if file was written with actual content
+            if trimmed.contains("wrote 0 bytes") || trimmed.contains("empty") {
+                return false;
+            }
+        }
+
+        true
+    }
+
     fn build_status_message(plan: &ExecutionPlan) -> String {
         let pending = plan.get_pending_tasks();
         let incomplete = plan.get_incomplete_tasks();
@@ -697,7 +763,41 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
                         arguments: args.clone(),
                     });
 
-                    let result = self.registry.execute(&tool_name, args).await?;
+                    // For write_file, check if content is meaningful BEFORE writing
+                    if tool_name == "write_file" {
+                        if let Some(content) = args.get("content").and_then(|c| c.as_str()) {
+                            if !Self::is_meaningful_result(content, "content_check") {
+                                // Content is placeholder - reject without executing
+                                {
+                                    let mut p = plan.write().await;
+                                    if let Some(task_id) = current_task {
+                                        p.update_task_status(task_id, TaskStatus::Pending);
+                                    }
+                                }
+
+                                step.tool_result = Some("❌ ОТКАЗАНО: placeholder контент".to_string());
+                                step.plan = Some(plan.read().await.clone());
+
+                                if let Some(ref callback) = self.step_callback {
+                                    callback(&step);
+                                }
+                                steps.push(step);
+
+                                let status = Self::build_status_message(&*plan.read().await);
+                                messages.push(Message::assistant(&response_text));
+                                messages.push(Message::user(&format!(
+                                    "❌ ОТКАЗАНО! Контент содержит placeholder или пустой!\n\
+                                    Сначала получи РЕАЛЬНЫЕ данные (web_search -> web_fetch),\n\
+                                    затем напиши их в файл.\n\
+                                    НЕ пиши 'информация будет позже' или подобное!\n\n{}\nОтветь JSON.",
+                                    status
+                                )));
+                                continue;
+                            }
+                        }
+                    }
+
+                    let result = self.registry.execute(&tool_name, args.clone()).await?;
 
                     let result_str = if result.success {
                         result.output.clone()
@@ -705,10 +805,14 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
                         format!("Error: {}", result.error.clone().unwrap_or_default())
                     };
 
+                    // Check if result is meaningful (not empty or placeholder)
+                    let is_result_meaningful = Self::is_meaningful_result(&result_str, &tool_name);
+
                     // Mark task as completed or failed
+                    let task_feedback;
                     if let Some(task_id) = current_task {
                         let mut p = plan.write().await;
-                        if result.success {
+                        if result.success && is_result_meaningful {
                             // Truncate result for storage (UTF-8 safe)
                             let short_result = if result_str.len() > 200 {
                                 let truncate_at = result_str
@@ -722,15 +826,30 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
                                 result_str.clone()
                             };
                             p.set_task_result(task_id, short_result);
+                            task_feedback = format!("✅ Задача {} выполнена успешно.", task_id);
+                        } else if result.success && !is_result_meaningful {
+                            // Result is empty/useless - keep task pending
+                            p.update_task_status(task_id, TaskStatus::Pending);
+                            task_feedback = format!(
+                                "⚠️ Результат ПУСТОЙ или БЕСПОЛЕЗНЫЙ! Задача {} НЕ ВЫПОЛНЕНА.\n\
+                                Попробуй другой подход:\n\
+                                - Используй другой URL или поисковый запрос\n\
+                                - Измени параметры инструмента\n\
+                                - Не пиши placeholder в файл, только реальные данные!",
+                                task_id
+                            );
                         } else {
                             p.fail_task(task_id, result_str.clone());
+                            task_feedback = format!("❌ Задача {} провалилась: {}", task_id, result_str);
                         }
+                    } else {
+                        task_feedback = String::new();
                     }
 
                     step.tool_result = Some(result_str.clone());
                     step.plan = Some(plan.read().await.clone());
 
-                    info!(tool = %tool_name, success = result.success, "Tool execution complete");
+                    info!(tool = %tool_name, success = result.success, meaningful = is_result_meaningful, "Tool execution complete");
 
                     if let Some(ref callback) = self.step_callback {
                         callback(&step);
@@ -740,8 +859,8 @@ REMEMBER: Output ONLY valid JSON! Complete ALL tasks!
                     let status = Self::build_status_message(&*plan.read().await);
                     messages.push(Message::assistant(&response_text));
                     messages.push(Message::user(&format!(
-                        "Результат {}:\n{}\n\n{}\nОтветь JSON.",
-                        tool_name, result_str, status
+                        "Результат {}:\n{}\n\n{}\n\n{}\nОтветь JSON.",
+                        tool_name, result_str, task_feedback, status
                     )));
                 }
 

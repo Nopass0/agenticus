@@ -5,7 +5,7 @@ mod llm;
 mod logging;
 mod tools;
 
-use agent::{Agent, AgentBuilder};
+use agent::Agent;
 use anyhow::Result;
 use cli::*;
 use config::Config;

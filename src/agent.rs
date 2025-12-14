@@ -1,8 +1,9 @@
 use crate::config::Config;
-use crate::llm::{LlmProvider, LlmResponse, Message, ToolCall};
+use crate::llm::{LlmProvider, Message};
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use chrono::Utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -38,6 +39,21 @@ pub struct InteractionLog {
     pub success: bool,
 }
 
+/// Parsed response from model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelResponse {
+    #[serde(default)]
+    thought: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    args: Option<Value>,
+    #[serde(default)]
+    answer: Option<String>,
+}
+
 /// Callback for step updates
 pub type StepCallback = Box<dyn Fn(&ReasoningStep) + Send + Sync>;
 
@@ -68,49 +84,110 @@ impl Agent {
         self
     }
 
-    /// Create the system prompt
+    /// Create the system prompt with JSON response format
     fn system_prompt(&self) -> String {
         let tools_desc = self.registry.format_for_prompt();
         let language = &self.config.general.language;
 
         format!(
             r#"You are Agenticus, a powerful AI assistant with access to various tools.
-Your responses should be in {language}.
-
-IMPORTANT: You MUST use tools to answer questions. DO NOT ask for permission - just use the tools directly!
-
-When the user asks a question that requires information (like processes, time, system info, web search, etc.), IMMEDIATELY call the appropriate tool.
+You MUST respond in {language}.
 
 {tools_desc}
 
-## CRITICAL RULES
+## RESPONSE FORMAT
 
-1. **ALWAYS USE TOOLS** - When a user asks about processes, system info, time, web content, etc., call the tool IMMEDIATELY. DO NOT ask "do you want me to...?" - just do it!
+You MUST respond with a JSON object. No other text outside JSON!
 
-2. **BE PROACTIVE** - If the user asks "what processes are running?", call list_processes right away. If they ask "what time is it?", call get_datetime immediately.
+When you need to use a tool:
+```json
+{{
+  "thought": "краткое размышление о том что нужно сделать",
+  "action": "use_tool",
+  "tool": "tool_name",
+  "args": {{"param1": "value1", "param2": "value2"}}
+}}
+```
 
-3. **CHAIN TOOLS** - You can call multiple tools in sequence. After getting one result, you can call another tool.
+When you have the final answer:
+```json
+{{
+  "thought": "краткий итог",
+  "action": "final_answer",
+  "answer": "Полный ответ пользователю на {language}"
+}}
+```
 
-4. **FINAL ANSWER** - Only after you have gathered all needed information using tools, provide a complete answer summarizing the results.
+## RULES
 
-## Examples of correct behavior:
+1. ALWAYS use tools when user asks about: time, system info, processes, web search, memory, etc.
+2. DO NOT ask permission - just use the tool!
+3. After getting tool result, analyze it and either use another tool or give final answer.
+4. ONLY output valid JSON, nothing else!
 
-User: "What processes are running?"
-→ IMMEDIATELY call list_processes tool, then summarize the results
+## EXAMPLES
 
-User: "What's the weather?"
-→ Call web_search with query "weather today", then summarize
+User: "Который час?"
+```json
+{{"thought": "Нужно узнать время", "action": "use_tool", "tool": "get_datetime", "args": {{}}}}
+```
 
-User: "What time is it?"
-→ Call get_datetime immediately
+User: "Открой блокнот"
+```json
+{{"thought": "Нужно запустить notepad", "action": "use_tool", "tool": "launch_app", "args": {{"app": "notepad"}}}}
+```
 
-User: "Remember my name is John"
-→ Call memory_save with key="user_name", value="John"
+User: "Какие процессы запущены?"
+```json
+{{"thought": "Покажу список процессов", "action": "use_tool", "tool": "list_processes", "args": {{"limit": 20}}}}
+```
 
-NEVER respond with just text asking if the user wants you to do something. USE THE TOOLS!
+User: "Запомни что меня зовут Иван"
+```json
+{{"thought": "Сохраню имя в память", "action": "use_tool", "tool": "memory_save", "args": {{"key": "user_name", "value": "Иван"}}}}
+```
 
-Respond in {language}."#
+IMPORTANT: Output ONLY valid JSON! No markdown, no explanations outside JSON!"#
         )
+    }
+
+    /// Extract JSON from response text
+    fn extract_json(&self, text: &str) -> Option<Value> {
+        // Try to parse directly
+        if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+            return Some(v);
+        }
+
+        // Try to find JSON in code blocks
+        let re = Regex::new(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```").ok()?;
+        if let Some(caps) = re.captures(text) {
+            if let Ok(v) = serde_json::from_str::<Value>(&caps[1]) {
+                return Some(v);
+            }
+        }
+
+        // Try to find raw JSON object
+        let re2 = Regex::new(r"\{[\s\S]*\}").ok()?;
+        if let Some(m) = re2.find(text) {
+            if let Ok(v) = serde_json::from_str::<Value>(m.as_str()) {
+                return Some(v);
+            }
+        }
+
+        None
+    }
+
+    /// Parse model response
+    fn parse_response(&self, text: &str) -> Option<ModelResponse> {
+        let json = self.extract_json(text)?;
+
+        Some(ModelResponse {
+            thought: json.get("thought").and_then(|v| v.as_str()).map(String::from),
+            action: json.get("action").and_then(|v| v.as_str()).map(String::from),
+            tool: json.get("tool").and_then(|v| v.as_str()).map(String::from),
+            args: json.get("args").cloned(),
+            answer: json.get("answer").and_then(|v| v.as_str()).map(String::from),
+        })
     }
 
     /// Run the agent on a user query
@@ -129,13 +206,6 @@ Respond in {language}."#
             Message::user(user_query),
         ];
 
-        let tools = self.registry.to_json_schemas();
-        let tools_ref = if tools.is_empty() {
-            None
-        } else {
-            Some(tools.as_slice())
-        };
-
         let mut steps: Vec<ReasoningStep> = Vec::new();
         let mut final_response: Option<String> = None;
         let max_steps = self.config.general.max_steps;
@@ -143,38 +213,78 @@ Respond in {language}."#
         for step_num in 1..=max_steps {
             debug!(step = step_num, "Executing step");
 
-            // Get LLM response
-            let response = self.provider.generate(&messages, tools_ref).await?;
+            // Get LLM response (no tools passed - we use JSON parsing)
+            let response = self.provider.generate(&messages, None).await?;
+
+            let response_text = response.content.clone().unwrap_or_default();
+            debug!("Raw response: {}", &response_text);
+
+            // Parse JSON response
+            let parsed = match self.parse_response(&response_text) {
+                Some(p) => p,
+                None => {
+                    // If we can't parse JSON, treat the response as final answer
+                    warn!("Could not parse JSON response, treating as final answer");
+                    let mut step = ReasoningStep {
+                        step_number: step_num,
+                        timestamp: Utc::now().to_rfc3339(),
+                        thought: None,
+                        tool_call: None,
+                        tool_result: None,
+                        is_final: true,
+                    };
+
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
+                    }
+                    steps.push(step);
+                    final_response = Some(response_text);
+                    break;
+                }
+            };
 
             // Create step record
             let mut step = ReasoningStep {
                 step_number: step_num,
                 timestamp: Utc::now().to_rfc3339(),
-                thought: response.content.clone(),
+                thought: parsed.thought.clone(),
                 tool_call: None,
                 tool_result: None,
                 is_final: false,
             };
 
-            // Check if we have tool calls
-            if response.has_tool_calls() {
-                for tool_call in &response.tool_calls {
+            // Check action type
+            match parsed.action.as_deref() {
+                Some("use_tool") => {
+                    let tool_name = match &parsed.tool {
+                        Some(t) => t.clone(),
+                        None => {
+                            warn!("No tool specified in use_tool action");
+                            step.is_final = true;
+                            final_response = Some("Ошибка: не указан инструмент".to_string());
+                            if let Some(ref callback) = self.step_callback {
+                                callback(&step);
+                            }
+                            steps.push(step);
+                            break;
+                        }
+                    };
+
+                    let args = parsed.args.clone().unwrap_or(Value::Object(serde_json::Map::new()));
+
                     info!(
-                        tool = %tool_call.name,
-                        args = %tool_call.arguments,
+                        tool = %tool_name,
+                        args = %args,
                         "Executing tool"
                     );
 
                     step.tool_call = Some(ToolCallRecord {
-                        name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.clone(),
+                        name: tool_name.clone(),
+                        arguments: args.clone(),
                     });
 
                     // Execute the tool
-                    let result = self
-                        .registry
-                        .execute(&tool_call.name, tool_call.arguments.clone())
-                        .await?;
+                    let result = self.registry.execute(&tool_name, args).await?;
 
                     let result_str = if result.success {
                         result.output
@@ -185,43 +295,45 @@ Respond in {language}."#
                     step.tool_result = Some(result_str.clone());
 
                     info!(
-                        tool = %tool_call.name,
+                        tool = %tool_name,
                         success = result.success,
                         "Tool execution complete"
                     );
 
-                    // Add assistant message with tool call info
-                    if let Some(thought) = &response.content {
-                        messages.push(Message::assistant(thought));
+                    // Notify callback
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
                     }
+                    steps.push(step);
 
-                    // Add tool result
-                    messages.push(Message::tool(&result_str, &tool_call.id));
+                    // Add to conversation for next iteration
+                    messages.push(Message::assistant(&response_text));
+                    messages.push(Message::user(&format!(
+                        "Tool result for {}:\n{}\n\nAnalyze the result and respond with JSON. Either use another tool or provide final answer.",
+                        tool_name, result_str
+                    )));
                 }
-            } else {
-                // No tool calls - this is the final response
-                step.is_final = true;
-                final_response = response.content.clone();
+                Some("final_answer") => {
+                    step.is_final = true;
+                    final_response = parsed.answer.or(parsed.thought);
 
-                if let Some(ref callback) = self.step_callback {
-                    callback(&step);
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
+                    }
+                    steps.push(step);
+                    break;
                 }
+                _ => {
+                    // Unknown action or no action - treat as final
+                    step.is_final = true;
+                    final_response = parsed.answer.or(parsed.thought).or(Some(response_text));
 
-                steps.push(step);
-                break;
-            }
-
-            // Notify callback
-            if let Some(ref callback) = self.step_callback {
-                callback(&step);
-            }
-
-            steps.push(step);
-
-            // Check if we should stop
-            if response.is_complete() && !response.has_tool_calls() {
-                final_response = response.content;
-                break;
+                    if let Some(ref callback) = self.step_callback {
+                        callback(&step);
+                    }
+                    steps.push(step);
+                    break;
+                }
             }
         }
 
@@ -233,7 +345,7 @@ Respond in {language}."#
                 max_steps,
                 steps
                     .iter()
-                    .filter_map(|s| s.thought.clone())
+                    .filter_map(|s| s.tool_result.clone())
                     .collect::<Vec<_>>()
                     .join("\n")
             ));
@@ -244,9 +356,9 @@ Respond in {language}."#
             timestamp: start_time.to_rfc3339(),
             user_query: user_query.to_string(),
             steps: steps.clone(),
-            final_response: final_response.clone(),
+            final_response,
             total_steps: steps.len(),
-            success: final_response.is_some(),
+            success: true,
         };
 
         info!(
@@ -256,40 +368,5 @@ Respond in {language}."#
         );
 
         Ok(log)
-    }
-}
-
-/// Builder for creating agents
-pub struct AgentBuilder {
-    provider: Option<Arc<dyn LlmProvider>>,
-    registry: ToolRegistry,
-    config: Config,
-}
-
-impl AgentBuilder {
-    pub fn new(config: Config) -> Self {
-        Self {
-            provider: None,
-            registry: ToolRegistry::new(),
-            config,
-        }
-    }
-
-    pub fn with_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
-        self.provider = Some(provider);
-        self
-    }
-
-    pub fn with_registry(mut self, registry: ToolRegistry) -> Self {
-        self.registry = registry;
-        self
-    }
-
-    pub fn build(self) -> Result<Agent> {
-        let provider = self
-            .provider
-            .ok_or_else(|| anyhow::anyhow!("LLM provider is required"))?;
-
-        Ok(Agent::new(provider, Arc::new(self.registry), self.config))
     }
 }

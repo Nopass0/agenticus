@@ -1,0 +1,74 @@
+[package]
+name = "agenticus"
+version = "0.1.0"
+edition = "2021"
+description = "AI Agent with tool-calling capabilities"
+authors = ["Agenticus Team"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# TOML config
+toml = "0.8"
+
+# CLI colors and formatting
+colored = "2.1"
+crossterm = "0.27"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# System info
+sysinfo = "0.31"
+
+# Screenshot
+screenshots = "0.8"
+
+# Image encoding
+image = "0.25"
+base64 = "0.22"
+
+# File system
+dirs = "5.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Async traits
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# UUID for unique IDs
+uuid = { version = "1.6", features = ["v4"] }
+
+# HTML parsing for web scraping
+scraper = "0.20"
+
+# URL handling
+url = "2.5"
+
+# Regex
+regex = "1.10"
+
+# Open URLs in browser
+webbrowser = "1.0"
+
+# For running commands
+which = "6.0"
+
+[profile.release]
+opt-level = 3
+lto = true

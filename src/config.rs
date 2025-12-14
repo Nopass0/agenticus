@@ -88,7 +88,7 @@ fn default_openrouter_url() -> String {
 }
 
 fn default_openrouter_model() -> String {
-    "google/gemini-2.0-flash-lite-001".to_string()
+    "google/gemini-2.0-flash-001".to_string()  // Full version supports tool calling
 }
 
 fn default_log_dir() -> String {

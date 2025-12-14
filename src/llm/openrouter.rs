@@ -122,11 +122,18 @@ impl LlmProvider for OpenRouterProvider {
             messages: openrouter_messages,
             tools: tools.map(|t| t.to_vec()),
             tool_choice: tools.map(|_| "auto".to_string()),
-            temperature: 0.7,
+            temperature: 0.5,
             max_tokens: 4096,
         };
 
         let url = format!("{}/chat/completions", self.base_url);
+
+        // Debug logging
+        tracing::debug!(
+            "OpenRouter request to model {}: {} tools provided",
+            self.model,
+            tools.map(|t| t.len()).unwrap_or(0)
+        );
 
         let response = self
             .client
@@ -140,12 +147,16 @@ impl LlmProvider for OpenRouterProvider {
             .await?;
 
         let status = response.status();
+        let response_text = response.text().await?;
+
+        tracing::debug!("OpenRouter response status: {}", status);
+        tracing::debug!("OpenRouter response: {}", &response_text[..response_text.len().min(500)]);
+
         if !status.is_success() {
-            let error_text = response.text().await?;
-            anyhow::bail!("OpenRouter API error ({}): {}", status, error_text);
+            anyhow::bail!("OpenRouter API error ({}): {}", status, response_text);
         }
 
-        let openrouter_response: OpenRouterResponse = response.json().await?;
+        let openrouter_response: OpenRouterResponse = serde_json::from_str(&response_text)?;
 
         if let Some(error) = openrouter_response.error {
             anyhow::bail!("OpenRouter error: {}", error.message);
